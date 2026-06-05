@@ -81,13 +81,20 @@ impl Session {
 			Err(ParseError::LineTooLong) => Action::Continue(Reply::single(500, "line too long")),
 			Err(ParseError::InvalidCharacters) => Action::Continue(Reply::syntax_error()),
 			Err(ParseError::InvalidArguments) => Action::Continue(Reply::invalid_arguments()),
+			Err(ParseError::UnsupportedParameter) => {
+				Action::Continue(Reply::single(555, "parameter not implemented"))
+			}
 		}
 	}
 
 	fn apply(&mut self, command: Command) -> Action {
 		match command {
 			Command::Helo { domain } | Command::Ehlo { domain } => self.greet(domain),
-			Command::MailFrom { reverse_path } => self.mail_from(reverse_path),
+			Command::MailFrom {
+				reverse_path,
+				size,
+				body: _,
+			} => self.mail_from(reverse_path, size),
 			Command::RcptTo { forward_path } => self.rcpt_to(forward_path),
 			Command::Data => self.data(),
 			Command::Rset => {
@@ -115,9 +122,13 @@ impl Session {
 		Action::Continue(Reply::new(250, lines))
 	}
 
-	fn mail_from(&mut self, reverse_path: String) -> Action {
+	fn mail_from(&mut self, reverse_path: String, size: Option<u64>) -> Action {
 		match self.state {
 			State::Greeted => {
+				// SIZE is declared up front: reject oversize without DATA.
+				if size.is_some_and(|s| s > MAX_MESSAGE_SIZE as u64) {
+					return Action::Continue(Reply::single(552, "message exceeds maximum size"));
+				}
 				self.state = State::ReceivingRecipients { reverse_path };
 				Action::Continue(Reply::ok())
 			}
@@ -331,6 +342,38 @@ mod tests {
 			reply_code(&session.command_line("MAIL FROM:<c@example.org>")),
 			250
 		);
+	}
+
+	#[test]
+	fn declared_size_within_limit_is_accepted() {
+		let mut session = greeted();
+		let action = session.command_line(&format!(
+			"MAIL FROM:<a@example.org> SIZE={} BODY=8BITMIME",
+			MAX_MESSAGE_SIZE
+		));
+		assert_eq!(reply_code(&action), 250);
+	}
+
+	#[test]
+	fn declared_oversize_is_rejected_at_mail_time() {
+		let mut session = greeted();
+		let action = session.command_line(&format!(
+			"MAIL FROM:<a@example.org> SIZE={}",
+			MAX_MESSAGE_SIZE as u64 + 1
+		));
+		assert_eq!(reply_code(&action), 552);
+		// The transaction never started: RCPT must fail.
+		assert_eq!(
+			reply_code(&session.command_line("RCPT TO:<b@example.org>")),
+			503
+		);
+	}
+
+	#[test]
+	fn unsupported_parameter_gets_555() {
+		let mut session = greeted();
+		let action = session.command_line("MAIL FROM:<a@example.org> AUTH=<>");
+		assert_eq!(reply_code(&action), 555);
 	}
 
 	#[test]
