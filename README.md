@@ -10,8 +10,11 @@ Self-hosted, headless mail server — SMTP, IMAP and modern email security throu
 flowchart LR
 	client([SMTP client]) -->|25 / 587 / 465| tls[TLS / STARTTLS]
 	tls --> smtp[SMTP listener]
-	smtp --> session[Session state machine]
-	session -->|local recipients only| mailbox[(Account mailboxes)]
+	smtp --> session[Session + AUTH]
+	session --> auth[SPF / DKIM / DMARC]
+	auth -->|local| mailbox[(Account mailboxes)]
+	auth -->|relay, DKIM-signed| queue[(Outbound queue)]
+	queue -->|MX + STARTTLS| internet([Remote servers])
 	cli[CLI] --> config[Config / fail-closed validation]
 	config --> smtp
 ```
@@ -22,10 +25,14 @@ flowchart LR
 - 🔐 **TLS everywhere** — STARTTLS (RFC 3207) on SMTP/submission, implicit TLS for `submissions`; rustls, no OpenSSL; broken TLS material refuses to start instead of degrading
 - 🛡️ **Smuggling-immune by construction** — bare CR, bare LF or NUL anywhere in the stream closes the connection; CRLF is enforced at the framing layer
 - 🚫 **No relay, no ghosts** — recipients outside the configured `domains` answer `550 5.7.1`, unknown users in local domains answer `550 5.1.1`; with nothing configured everything is denied (fail closed)
+- ✅ **Full authentication chain** — SPF (RFC 7208) with `fail` rejection, DKIM verification (RFC 6376, rsa + ed25519), DMARC alignment and policy enforcement (RFC 7489); results recorded in `Authentication-Results`
+- ✍️ **DKIM signing** — outbound mail signed with ed25519; `mail dkim-keygen` generates the key and prints the DNS record
+- 🔑 **Submission with AUTH** — `AUTH PLAIN` over TLS only, argon2id password hashes, no user-enumeration oracle; authenticated users relay from their own addresses
+- 📤 **Outbound queue** — MX resolution, opportunistic STARTTLS, per-domain delivery with retry/backoff semantics
 - 📬 **Local delivery** — accepted mail lands once per recipient account under `data_dir/accounts/<name>/new/`
 - 🔒 **Secure by default** — listeners bind to localhost unless explicitly configured otherwise; configuration fails closed on any unknown key or invalid value
 - 💾 **Crash-safe writes** — accepted messages are fsynced and atomically renamed into the mailbox before the server answers `250`
-- 🧰 **Operator CLI** — `mail serve`, `mail config-check`, meaningful exit codes
+- 🧰 **Operator CLI** — `mail serve`, `mail config-check`, `mail dkim-keygen`, meaningful exit codes
 
 ## 🚀 Quick start
 
@@ -59,7 +66,7 @@ addr = "0.0.0.0"
 
 ## 🗺️ Roadmap
 
-Storage model, SPF/DKIM/DMARC, outbound queue, IMAP4rev2 and the management API are tracked in the [issues](https://github.com/Glyndor/mail/issues).
+Mailbox model (flags/quotas), DSN bounces, MTA-STS/DANE, IMAP4rev2 and the management API are tracked in the [issues](https://github.com/Glyndor/mail/issues).
 
 ## 📄 License
 
