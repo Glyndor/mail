@@ -61,6 +61,15 @@ async fn serve(config: Config) -> std::io::Result<()> {
 		Arc::clone(&directory),
 	)?);
 
+	// The queue worker drains the outbound spool in the background.
+	let connector = Arc::new(crate::queue::MxConnector::from_system()?);
+	let worker = Arc::new(crate::queue::Worker::new(
+		crate::storage::FsSpool::open(&config.data_dir)?,
+		connector,
+		&config.hostname,
+	));
+	tokio::spawn(worker.run(std::time::Duration::from_secs(30)));
+
 	// TLS is loaded once and shared; failure to load is fatal (fail closed).
 	let tls_acceptor = match &config.tls {
 		Some(tls_config) => Some(crate::tls::acceptor(tls_config).map_err(std::io::Error::other)?),

@@ -7,6 +7,7 @@
 pub mod cli;
 pub mod clock;
 pub mod config;
+pub mod queue;
 pub mod smtp;
 pub mod storage;
 pub mod tls;
