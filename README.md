@@ -8,9 +8,10 @@ Self-hosted, headless mail server — SMTP, IMAP and modern email security throu
 
 ```mermaid
 flowchart LR
-	client([SMTP client]) -->|25 / 587 / 465| smtp[SMTP listener]
+	client([SMTP client]) -->|25 / 587 / 465| tls[TLS / STARTTLS]
+	tls --> smtp[SMTP listener]
 	smtp --> session[Session state machine]
-	session --> spool[(Crash-safe spool)]
+	session -->|local domains only| spool[(Crash-safe spool)]
 	cli[CLI] --> config[Config / fail-closed validation]
 	config --> smtp
 ```
@@ -18,7 +19,9 @@ flowchart LR
 ## ✨ What works today
 
 - 📨 **SMTP server core** — strict RFC 5321 session handling: HELO/EHLO, MAIL FROM (with `SIZE`/`BODY`), RCPT TO, DATA, RSET, NOOP, QUIT
+- 🔐 **TLS everywhere** — STARTTLS (RFC 3207) on SMTP/submission, implicit TLS for `submissions`; rustls, no OpenSSL; broken TLS material refuses to start instead of degrading
 - 🛡️ **Smuggling-immune by construction** — bare CR, bare LF or NUL anywhere in the stream closes the connection; CRLF is enforced at the framing layer
+- 🚫 **No relay** — recipients outside the configured `domains` answer `550 5.7.1`; with no domains configured everything is denied (fail closed)
 - 🔒 **Secure by default** — listeners bind to localhost unless explicitly configured otherwise; configuration fails closed on any unknown key or invalid value
 - 💾 **Crash-safe spool** — accepted messages are fsynced and atomically renamed before the server answers `250`
 - 🧰 **Operator CLI** — `mail serve`, `mail config-check`, meaningful exit codes
@@ -31,6 +34,7 @@ cargo build --release
 cat > mail.toml <<'EOF'
 hostname = "mail.example.org"
 data_dir = "/var/lib/mail"
+domains = ["example.org"]
 
 [[listeners]]
 kind = "smtp"
