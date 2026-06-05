@@ -44,6 +44,7 @@ pub struct Server {
 	tls: Option<TlsAcceptor>,
 	tls_mode: TlsMode,
 	directory: Arc<Directory>,
+	spf: Option<Arc<dyn crate::spf::DnsLookup>>,
 }
 
 impl Server {
@@ -56,7 +57,14 @@ impl Server {
 			tls: None,
 			tls_mode: TlsMode::Opportunistic,
 			directory: Arc::new(Directory::default()),
+			spf: None,
 		}
+	}
+
+	/// Enable SPF verification of unauthenticated inbound mail.
+	pub fn with_spf(mut self, dns: Arc<dyn crate::spf::DnsLookup>) -> Self {
+		self.spf = Some(dns);
+		self
 	}
 
 	/// Enable TLS with the given acceptor and mode.
@@ -182,6 +190,41 @@ impl Server {
 					send(&mut stream, &reply).await?;
 				}
 				Action::Deliver(reply, mut message) => {
+					// SPF applies to unauthenticated mail from a known peer.
+					let mut spf_header = None;
+					if let (Some(dns), Some(ip), None) = (&self.spf, peer, session.authenticated())
+					{
+						let domain = spf_domain(&message.reverse_path, session.helo_domain());
+						let outcome = match &domain {
+							Some(domain) => crate::spf::check_host(dns.as_ref(), ip, domain).await,
+							None => crate::spf::SpfOutcome::None,
+						};
+						match outcome {
+							crate::spf::SpfOutcome::Fail => {
+								send(
+									&mut stream,
+									&Reply::single(550, "5.7.23 SPF validation failed"),
+								)
+								.await?;
+								continue;
+							}
+							crate::spf::SpfOutcome::TempError => {
+								send(
+									&mut stream,
+									&Reply::single(451, "4.4.3 SPF check temporarily failed"),
+								)
+								.await?;
+								continue;
+							}
+							outcome => {
+								spf_header = Some(format!(
+									"Received-SPF: {} (domain of {}) client-ip={ip}\r\n",
+									outcome.as_str(),
+									domain.as_deref().unwrap_or("unknown"),
+								));
+							}
+						}
+					}
 					let header = received_header(
 						session.helo_domain(),
 						peer,
@@ -190,6 +233,9 @@ impl Server {
 						std::time::SystemTime::now(),
 					);
 					let mut stamped = header.into_bytes();
+					if let Some(spf_header) = spf_header {
+						stamped.extend_from_slice(spf_header.as_bytes());
+					}
 					stamped.append(&mut message.data);
 					message.data = stamped;
 					let reply = match self.sink.deliver(message) {
@@ -225,6 +271,17 @@ impl Server {
 			}
 		}
 	}
+}
+
+/// The domain SPF evaluates: the MAIL FROM domain, or the HELO domain for
+/// the null reverse-path (RFC 7208 section 2.4).
+fn spf_domain(reverse_path: &str, helo: Option<&str>) -> Option<String> {
+	if reverse_path.is_empty() {
+		return helo.map(|h| h.to_string());
+	}
+	reverse_path
+		.rsplit_once('@')
+		.map(|(_, domain)| domain.to_ascii_lowercase())
 }
 
 /// Build the RFC 5321 section 4.4 trace header prepended to accepted mail.
@@ -400,6 +457,92 @@ DATA\r\n\
 		assert!(output.contains("454 TLS not available"), "{output}");
 	}
 
+	/// DNS stub serving one SPF TXT record for `sender.example`.
+	struct OneRecordDns {
+		record: &'static str,
+	}
+
+	type DnsFuture<'a, T> =
+		std::pin::Pin<Box<dyn Future<Output = Result<T, crate::spf::DnsFailure>> + Send + 'a>>;
+
+	impl crate::spf::DnsLookup for OneRecordDns {
+		fn txt(&self, name: &str) -> DnsFuture<'_, Vec<String>> {
+			let result = if name == "sender.example" {
+				vec![self.record.to_string()]
+			} else {
+				Vec::new()
+			};
+			Box::pin(async move { Ok(result) })
+		}
+
+		fn addresses(&self, _name: &str) -> DnsFuture<'_, Vec<std::net::IpAddr>> {
+			Box::pin(async { Ok(Vec::new()) })
+		}
+
+		fn mx(&self, _name: &str) -> DnsFuture<'_, Vec<String>> {
+			Box::pin(async { Ok(Vec::new()) })
+		}
+	}
+
+	async fn converse_with_spf(record: &'static str) -> (String, Arc<MemorySink>) {
+		let sink = Arc::new(MemorySink::new());
+		let server = Server::new("mail.example.org", sink.clone() as Arc<dyn MessageSink>)
+			.with_directory(test_directory())
+			.with_spf(Arc::new(OneRecordDns { record }));
+
+		let (client, server_stream) = tokio::io::duplex(64 * 1024);
+		let peer = Some("192.0.2.7".parse().expect("ip"));
+		let task = tokio::spawn(async move { server.handle(server_stream, peer).await });
+
+		let script = b"EHLO client.example.org\r\n\
+MAIL FROM:<eve@sender.example>\r\n\
+RCPT TO:<bob@example.org>\r\n\
+DATA\r\n\
+Subject: hi\r\n\
+\r\n\
+hello\r\n\
+.\r\n\
+QUIT\r\n";
+		let (mut client_read, mut client_write) = tokio::io::split(client);
+		client_write.write_all(script).await.expect("client write");
+		client_write.shutdown().await.expect("client shutdown");
+		let mut output = Vec::new();
+		client_read
+			.read_to_end(&mut output)
+			.await
+			.expect("client read");
+		task.await.expect("task").expect("server result");
+		(String::from_utf8(output).expect("ascii"), sink)
+	}
+
+	#[tokio::test]
+	async fn spf_fail_rejects_the_message() {
+		let (output, sink) = converse_with_spf("v=spf1 -all").await;
+		assert!(output.contains("550 5.7.23"), "{output}");
+		assert!(sink.messages().is_empty());
+	}
+
+	#[tokio::test]
+	async fn spf_pass_stamps_received_spf_header() {
+		let (output, sink) = converse_with_spf("v=spf1 ip4:192.0.2.0/24 -all").await;
+		assert!(!output.contains("550"), "{output}");
+		let messages = sink.messages();
+		assert_eq!(messages.len(), 1);
+		let data = String::from_utf8(messages[0].data.clone()).expect("ascii");
+		assert!(
+			data.contains("Received-SPF: pass (domain of sender.example) client-ip=192.0.2.7"),
+			"{data}"
+		);
+	}
+
+	#[tokio::test]
+	async fn spf_softfail_is_accepted_and_recorded() {
+		let (output, sink) = converse_with_spf("v=spf1 ~all").await;
+		assert!(!output.contains("550"), "{output}");
+		let data = String::from_utf8(sink.messages()[0].data.clone()).expect("ascii");
+		assert!(data.contains("Received-SPF: softfail"), "{data}");
+	}
+
 	/// Test client TLS connector trusting the given certificate.
 	fn test_connector(
 		cert: tokio_rustls::rustls::pki_types::CertificateDer<'static>,
@@ -520,6 +663,7 @@ DATA\r\n\
 			tls: None,
 			tls_mode: TlsMode::Implicit,
 			directory: Arc::new(Directory::default()),
+			spf: None,
 		};
 		let (_client, server_stream) = tokio::io::duplex(1024);
 		assert!(server.handle(server_stream, None).await.is_err());
