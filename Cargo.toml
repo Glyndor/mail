@@ -10,10 +10,12 @@ publish = false
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
 toml = "1.1.2"
 tracing = "0.1.44"
+uuid = { version = "1.23.2", features = ["v7", "serde"] }
 
 [profile.release]
 lto = "thin"

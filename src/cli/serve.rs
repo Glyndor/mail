@@ -7,7 +7,8 @@ use tokio::net::TcpListener;
 
 use crate::config::{Config, ListenerKind};
 use crate::smtp::server::Server;
-use crate::smtp::sink::{MemorySink, MessageSink};
+use crate::smtp::sink::MessageSink;
+use crate::storage::FsSpool;
 
 /// Run the server with a validated configuration.
 pub fn run(config: Config) -> ExitCode {
@@ -33,8 +34,8 @@ async fn serve(config: Config) -> std::io::Result<()> {
 		return Ok(());
 	}
 
-	// Storage is not implemented yet: messages go to a process-local sink.
-	let sink: Arc<dyn MessageSink> = Arc::new(MemorySink::new());
+	// Accepted messages land in the filesystem spool under data_dir.
+	let sink: Arc<dyn MessageSink> = Arc::new(FsSpool::open(&config.data_dir)?);
 	let mut tasks = Vec::new();
 
 	for listener_config in &config.listeners {
@@ -61,20 +62,26 @@ async fn serve(config: Config) -> std::io::Result<()> {
 mod tests {
 	use super::*;
 	use std::net::{IpAddr, Ipv4Addr};
+	use std::path::Path;
 
 	use crate::config::Listener;
+	use crate::smtp::sink::MemorySink;
 	use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-	fn test_config(listeners: Vec<Listener>) -> Config {
-		let toml = "hostname = \"mail.example.org\"\ndata_dir = \"/var/lib/mail\"\n";
-		let mut config: Config = toml::from_str(toml).expect("base config");
+	fn test_config(data_dir: &Path, listeners: Vec<Listener>) -> Config {
+		let toml = format!(
+			"hostname = \"mail.example.org\"\ndata_dir = \"{}\"\n",
+			data_dir.display()
+		);
+		let mut config: Config = toml::from_str(&toml).expect("base config");
 		config.listeners = listeners;
 		config
 	}
 
 	#[test]
 	fn run_with_no_listeners_exits_cleanly() {
-		assert_eq!(run(test_config(vec![])), ExitCode::SUCCESS);
+		let dir = tempfile::tempdir().expect("tempdir");
+		assert_eq!(run(test_config(dir.path(), vec![])), ExitCode::SUCCESS);
 	}
 
 	#[tokio::test]
@@ -105,9 +112,17 @@ mod tests {
 			.expect("probe bind");
 		let port = probe.local_addr().expect("addr").port();
 
+		let dir = tempfile::tempdir().expect("tempdir");
 		let listener: Listener =
 			toml::from_str(&format!("kind = \"smtp\"\nport = {port}")).expect("listener config");
-		let config = test_config(vec![listener]);
+		let config = test_config(dir.path(), vec![listener]);
+		assert!(serve(config).await.is_err());
+	}
+
+	#[tokio::test]
+	async fn serve_fails_on_unwritable_data_dir() {
+		let listener: Listener = toml::from_str("kind = \"smtp\"\nport = 0").expect("listener");
+		let config = test_config(Path::new("/proc/no-such-dir"), vec![listener]);
 		assert!(serve(config).await.is_err());
 	}
 }
