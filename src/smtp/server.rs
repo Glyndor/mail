@@ -224,10 +224,47 @@ impl Server {
 									domain.as_deref().unwrap_or("unknown"),
 								));
 
-								// DKIM is recorded, never rejected on: that
-								// policy decision belongs to DMARC.
+								// DKIM is recorded; DMARC decides policy.
 								let dkim_results =
 									crate::dkim::verify_message(dns.as_ref(), &message.data).await;
+
+								let from = crate::dmarc::from_domain(&message.data);
+								let dmarc = match &from {
+									Some(from) => {
+										crate::dmarc::evaluate(
+											dns.as_ref(),
+											from,
+											(outcome, domain.as_deref()),
+											&dkim_results,
+										)
+										.await
+									}
+									// No usable From header: nothing to align.
+									None => crate::dmarc::DmarcOutcome::PermError,
+								};
+								match dmarc {
+									crate::dmarc::DmarcOutcome::Reject => {
+										send(
+											&mut stream,
+											&Reply::single(550, "5.7.1 rejected by DMARC policy"),
+										)
+										.await?;
+										continue;
+									}
+									crate::dmarc::DmarcOutcome::TempError => {
+										send(
+											&mut stream,
+											&Reply::single(
+												451,
+												"4.4.3 DMARC check temporarily failed",
+											),
+										)
+										.await?;
+										continue;
+									}
+									_ => {}
+								}
+
 								let mut results = format!(
 									"Authentication-Results: {}; spf={}",
 									self.hostname,
@@ -241,6 +278,10 @@ impl Server {
 									if let Some(d) = &dkim.domain {
 										results.push_str(&format!(" header.d={d}"));
 									}
+								}
+								results.push_str(&format!("; dmarc={}", dmarc.as_str()));
+								if let Some(from) = &from {
+									results.push_str(&format!(" header.from={from}"));
 								}
 								results.push_str("\r\n");
 								auth_headers.push_str(&results);
