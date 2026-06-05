@@ -40,16 +40,19 @@ pub struct Server {
 	sink: Arc<dyn MessageSink>,
 	tls: Option<TlsAcceptor>,
 	tls_mode: TlsMode,
+	local_domains: Arc<std::collections::HashSet<String>>,
 }
 
 impl Server {
-	/// Create a plaintext server (STARTTLS unavailable).
+	/// Create a plaintext server (STARTTLS unavailable). Without
+	/// `with_local_domains` every recipient is rejected (fail closed).
 	pub fn new(hostname: &str, sink: Arc<dyn MessageSink>) -> Self {
 		Server {
 			hostname: hostname.to_string(),
 			sink,
 			tls: None,
 			tls_mode: TlsMode::Opportunistic,
+			local_domains: Arc::new(std::collections::HashSet::new()),
 		}
 	}
 
@@ -58,6 +61,16 @@ impl Server {
 		self.tls = Some(acceptor);
 		self.tls_mode = mode;
 		self
+	}
+
+	/// Set the domains this server accepts mail for (lowercased).
+	pub fn with_local_domains(mut self, domains: Arc<std::collections::HashSet<String>>) -> Self {
+		self.local_domains = domains;
+		self
+	}
+
+	fn new_session(&self) -> Session {
+		Session::new(&self.hostname).with_local_domains(Arc::clone(&self.local_domains))
 	}
 
 	/// Accept connections forever. Each connection runs in its own task.
@@ -82,20 +95,16 @@ impl Server {
 		match (self.tls_mode, &self.tls) {
 			(TlsMode::Implicit, Some(acceptor)) => {
 				let tls_stream = acceptor.accept(stream).await?;
-				let session = Session::new(&self.hostname);
-				self.run(Box::new(tls_stream), session).await
+				self.run(Box::new(tls_stream), self.new_session()).await
 			}
 			(TlsMode::Implicit, None) => Err(std::io::Error::other(
 				"implicit TLS listener without TLS acceptor",
 			)),
 			(TlsMode::Opportunistic, Some(_)) => {
-				let session = Session::new(&self.hostname).with_tls_available();
+				let session = self.new_session().with_tls_available();
 				self.run(Box::new(stream), session).await
 			}
-			(TlsMode::Opportunistic, None) => {
-				let session = Session::new(&self.hostname);
-				self.run(Box::new(stream), session).await
-			}
+			(TlsMode::Opportunistic, None) => self.run(Box::new(stream), self.new_session()).await,
 		}
 	}
 
@@ -216,10 +225,15 @@ mod tests {
 	use super::*;
 	use crate::smtp::sink::MemorySink;
 
+	fn test_domains() -> Arc<std::collections::HashSet<String>> {
+		Arc::new(std::collections::HashSet::from(["example.org".to_string()]))
+	}
+
 	/// Run one scripted client conversation, returning the full server output.
 	async fn converse(input: &[u8]) -> (String, Arc<MemorySink>) {
 		let sink = Arc::new(MemorySink::new());
-		let server = Server::new("mail.example.org", sink.clone() as Arc<dyn MessageSink>);
+		let server = Server::new("mail.example.org", sink.clone() as Arc<dyn MessageSink>)
+			.with_local_domains(test_domains());
 
 		let (client, server_stream) = tokio::io::duplex(64 * 1024);
 		let task = tokio::spawn(async move { server.handle(server_stream).await });
@@ -351,6 +365,7 @@ DATA\r\n\
 		let (acceptor, cert) = crate::tls::test_support::acceptor_and_cert();
 		let sink = Arc::new(MemorySink::new());
 		let server = Server::new("mail.example.org", sink.clone() as Arc<dyn MessageSink>)
+			.with_local_domains(test_domains())
 			.with_tls(acceptor, TlsMode::Opportunistic);
 
 		let (mut client, server_stream) = tokio::io::duplex(64 * 1024);
@@ -442,6 +457,7 @@ DATA\r\n\
 			sink: sink as Arc<dyn MessageSink>,
 			tls: None,
 			tls_mode: TlsMode::Implicit,
+			local_domains: Arc::new(std::collections::HashSet::new()),
 		};
 		let (_client, server_stream) = tokio::io::duplex(1024);
 		assert!(server.handle(server_stream).await.is_err());

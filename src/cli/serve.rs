@@ -37,6 +37,15 @@ async fn serve(config: Config) -> std::io::Result<()> {
 	// Accepted messages land in the filesystem spool under data_dir.
 	let sink: Arc<dyn MessageSink> = Arc::new(FsSpool::open(&config.data_dir)?);
 
+	// Domain matching is case-insensitive: store lowercase.
+	let local_domains = Arc::new(
+		config
+			.domains
+			.iter()
+			.map(|domain| domain.to_ascii_lowercase())
+			.collect::<std::collections::HashSet<_>>(),
+	);
+
 	// TLS is loaded once and shared; failure to load is fatal (fail closed).
 	let tls_acceptor = match &config.tls {
 		Some(tls_config) => Some(crate::tls::acceptor(tls_config).map_err(std::io::Error::other)?),
@@ -54,7 +63,8 @@ async fn serve(config: Config) -> std::io::Result<()> {
 					ListenerKind::Submissions => TlsMode::Implicit,
 					_ => TlsMode::Opportunistic,
 				};
-				let mut server = Server::new(&config.hostname, Arc::clone(&sink));
+				let mut server = Server::new(&config.hostname, Arc::clone(&sink))
+					.with_local_domains(Arc::clone(&local_domains));
 				if let Some(acceptor) = &tls_acceptor {
 					server = server.with_tls(acceptor.clone(), mode);
 				}

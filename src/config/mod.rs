@@ -41,6 +41,10 @@ pub struct Config {
 	pub hostname: String,
 	/// Directory where all server state lives.
 	pub data_dir: PathBuf,
+	/// Domains this server accepts mail for. Required when any listener
+	/// is configured: without it every recipient would be rejected.
+	#[serde(default)]
+	pub domains: Vec<String>,
 	/// Network listeners. Empty means the server starts nothing.
 	#[serde(default)]
 	pub listeners: Vec<Listener>,
