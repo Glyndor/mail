@@ -48,6 +48,8 @@ pub enum Action {
 	CollectData(Reply),
 	/// Send the reply, hand the message to delivery, keep reading commands.
 	Deliver(Reply, AcceptedMessage),
+	/// Send the reply, then upgrade the connection to TLS (RFC 3207).
+	UpgradeTls(Reply),
 	/// Send the reply and close the connection.
 	Close(Reply),
 }
@@ -57,15 +59,32 @@ pub enum Action {
 pub struct Session {
 	hostname: String,
 	state: State,
+	/// Whether STARTTLS can be offered (TLS configured, not yet active).
+	tls_available: bool,
 }
 
 impl Session {
-	/// Create a session for a freshly accepted connection.
+	/// Create a session for a freshly accepted plaintext connection.
 	pub fn new(hostname: &str) -> Self {
 		Session {
 			hostname: hostname.to_string(),
 			state: State::Connected,
+			tls_available: false,
 		}
+	}
+
+	/// Offer STARTTLS on this session.
+	pub fn with_tls_available(mut self) -> Self {
+		self.tls_available = true;
+		self
+	}
+
+	/// Called by the network layer once the TLS handshake completed.
+	/// Per RFC 3207 the server forgets everything learned before the
+	/// upgrade; the client must greet again.
+	pub fn tls_started(&mut self) {
+		self.state = State::Connected;
+		self.tls_available = false;
 	}
 
 	/// The greeting sent when the connection opens.
@@ -104,22 +123,33 @@ impl Session {
 			Command::Noop => Action::Continue(Reply::ok()),
 			Command::Quit => Action::Close(Reply::closing()),
 			Command::Vrfy => Action::Continue(Reply::vrfy_not_disclosed()),
-			Command::StartTls => {
-				// TLS upgrade is wired in the network layer; not yet available.
-				Action::Continue(Reply::single(454, "TLS not available"))
-			}
+			Command::StartTls => self.start_tls(),
 		}
 	}
 
 	fn greet(&mut self, _domain: String) -> Action {
 		self.state = State::Greeted;
-		let lines = vec![
+		let mut lines = vec![
 			self.hostname.clone(),
 			"PIPELINING".to_string(),
 			"8BITMIME".to_string(),
 			format!("SIZE {MAX_MESSAGE_SIZE}"),
 		];
+		if self.tls_available {
+			lines.push("STARTTLS".to_string());
+		}
 		Action::Continue(Reply::new(250, lines))
+	}
+
+	fn start_tls(&mut self) -> Action {
+		if !self.tls_available {
+			return Action::Continue(Reply::single(454, "TLS not available"));
+		}
+		match self.state {
+			// RFC 3207: STARTTLS requires EHLO first and no open transaction.
+			State::Greeted => Action::UpgradeTls(Reply::single(220, "ready to start TLS")),
+			_ => Action::Continue(Reply::bad_sequence()),
+		}
 	}
 
 	fn mail_from(&mut self, reverse_path: String, size: Option<u64>) -> Action {
@@ -235,7 +265,10 @@ mod tests {
 
 	fn reply_code(action: &Action) -> u16 {
 		match action {
-			Action::Continue(r) | Action::CollectData(r) | Action::Close(r) => r.code(),
+			Action::Continue(r)
+			| Action::CollectData(r)
+			| Action::UpgradeTls(r)
+			| Action::Close(r) => r.code(),
 			Action::Deliver(r, _) => r.code(),
 		}
 	}
@@ -391,8 +424,67 @@ mod tests {
 	}
 
 	#[test]
-	fn starttls_unavailable_for_now() {
+	fn starttls_without_tls_configured_is_unavailable() {
 		let mut session = greeted();
+		assert_eq!(reply_code(&session.command_line("STARTTLS")), 454);
+	}
+
+	#[test]
+	fn ehlo_advertises_starttls_when_available() {
+		let mut session = Session::new("mail.example.org").with_tls_available();
+		let Action::Continue(reply) = session.command_line("EHLO client.example.org") else {
+			panic!("expected continue");
+		};
+		assert!(reply.to_string().contains("250 STARTTLS\r\n"));
+	}
+
+	#[test]
+	fn ehlo_does_not_advertise_starttls_when_unavailable() {
+		let mut session = greeted();
+		let Action::Continue(reply) = session.command_line("EHLO client.example.org") else {
+			panic!("expected continue");
+		};
+		assert!(!reply.to_string().contains("STARTTLS"));
+	}
+
+	#[test]
+	fn starttls_upgrades_after_greeting() {
+		let mut session = Session::new("mail.example.org").with_tls_available();
+		session.command_line("EHLO client.example.org");
+		let action = session.command_line("STARTTLS");
+		assert!(matches!(action, Action::UpgradeTls(_)));
+		assert_eq!(reply_code(&action), 220);
+	}
+
+	#[test]
+	fn starttls_before_greeting_is_bad_sequence() {
+		let mut session = Session::new("mail.example.org").with_tls_available();
+		assert_eq!(reply_code(&session.command_line("STARTTLS")), 503);
+	}
+
+	#[test]
+	fn starttls_inside_transaction_is_bad_sequence() {
+		let mut session = Session::new("mail.example.org").with_tls_available();
+		session.command_line("EHLO client.example.org");
+		session.command_line("MAIL FROM:<a@example.org>");
+		assert_eq!(reply_code(&session.command_line("STARTTLS")), 503);
+	}
+
+	#[test]
+	fn tls_started_resets_session() {
+		let mut session = Session::new("mail.example.org").with_tls_available();
+		session.command_line("EHLO client.example.org");
+		session.tls_started();
+		// Must greet again before a transaction.
+		assert_eq!(
+			reply_code(&session.command_line("MAIL FROM:<a@example.org>")),
+			503
+		);
+		// And STARTTLS is no longer offered nor accepted.
+		let Action::Continue(reply) = session.command_line("EHLO client.example.org") else {
+			panic!("expected continue");
+		};
+		assert!(!reply.to_string().contains("STARTTLS"));
 		assert_eq!(reply_code(&session.command_line("STARTTLS")), 454);
 	}
 

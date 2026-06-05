@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 use super::line::{LineDecoder, LineError};
 use super::reply::Reply;
@@ -13,6 +14,10 @@ use super::sink::MessageSink;
 /// Read buffer size per connection.
 const READ_BUFFER: usize = 4096;
 
+/// Anything the connection loop can read from and write to.
+trait Connection: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Connection for T {}
+
 /// What the connection loop is currently reading.
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
@@ -20,19 +25,39 @@ enum Mode {
 	Data,
 }
 
+/// How a listener treats TLS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsMode {
+	/// Plaintext; STARTTLS offered when an acceptor is configured.
+	Opportunistic,
+	/// TLS handshake before any SMTP traffic (`submissions`).
+	Implicit,
+}
+
 /// SMTP server: one instance per listener.
 pub struct Server {
 	hostname: String,
 	sink: Arc<dyn MessageSink>,
+	tls: Option<TlsAcceptor>,
+	tls_mode: TlsMode,
 }
 
 impl Server {
-	/// Create a server identifying as `hostname`, delivering to `sink`.
+	/// Create a plaintext server (STARTTLS unavailable).
 	pub fn new(hostname: &str, sink: Arc<dyn MessageSink>) -> Self {
 		Server {
 			hostname: hostname.to_string(),
 			sink,
+			tls: None,
+			tls_mode: TlsMode::Opportunistic,
 		}
+	}
+
+	/// Enable TLS with the given acceptor and mode.
+	pub fn with_tls(mut self, acceptor: TlsAcceptor, mode: TlsMode) -> Self {
+		self.tls = Some(acceptor);
+		self.tls_mode = mode;
+		self
 	}
 
 	/// Accept connections forever. Each connection runs in its own task.
@@ -52,13 +77,35 @@ impl Server {
 	/// Drive one connection from greeting to close.
 	pub async fn handle<S>(&self, stream: S) -> std::io::Result<()>
 	where
-		S: AsyncRead + AsyncWrite + Unpin,
+		S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 	{
-		let (mut reader, writer) = tokio::io::split(stream);
-		let mut writer = BufWriter::new(writer);
+		match (self.tls_mode, &self.tls) {
+			(TlsMode::Implicit, Some(acceptor)) => {
+				let tls_stream = acceptor.accept(stream).await?;
+				let session = Session::new(&self.hostname);
+				self.run(Box::new(tls_stream), session).await
+			}
+			(TlsMode::Implicit, None) => Err(std::io::Error::other(
+				"implicit TLS listener without TLS acceptor",
+			)),
+			(TlsMode::Opportunistic, Some(_)) => {
+				let session = Session::new(&self.hostname).with_tls_available();
+				self.run(Box::new(stream), session).await
+			}
+			(TlsMode::Opportunistic, None) => {
+				let session = Session::new(&self.hostname);
+				self.run(Box::new(stream), session).await
+			}
+		}
+	}
 
-		let mut session = Session::new(&self.hostname);
-		send(&mut writer, &session.greeting()).await?;
+	/// The protocol loop over an established (plain or TLS) stream.
+	async fn run(
+		&self,
+		mut stream: Box<dyn Connection>,
+		mut session: Session,
+	) -> std::io::Result<()> {
+		send(&mut stream, &session.greeting()).await?;
 
 		let mut decoder = LineDecoder::new();
 		let mut mode = Mode::Commands;
@@ -68,7 +115,7 @@ impl Server {
 			let line = match decoder.next_line() {
 				Ok(Some(line)) => line,
 				Ok(None) => {
-					let read = reader.read(&mut buffer).await?;
+					let read = stream.read(&mut buffer).await?;
 					if read == 0 {
 						return Ok(());
 					}
@@ -76,21 +123,19 @@ impl Server {
 					continue;
 				}
 				Err(error) => {
-					send(&mut writer, &line_error_reply(&error)).await?;
+					send(&mut stream, &line_error_reply(&error)).await?;
 					return Ok(());
 				}
 			};
 
-			// SMTP is ASCII on the wire; data bytes above 127 (8BITMIME)
-			// pass through data mode untouched via lossy conversion guard.
 			let Ok(line) = String::from_utf8(line) else {
 				if mode == Mode::Commands {
-					send(&mut writer, &Reply::syntax_error()).await?;
+					send(&mut stream, &Reply::syntax_error()).await?;
 					continue;
 				}
 				// Binary in DATA: not yet supported, fail the transaction.
 				send(
-					&mut writer,
+					&mut stream,
 					&Reply::single(554, "8-bit data not yet supported"),
 				)
 				.await?;
@@ -107,10 +152,10 @@ impl Server {
 
 			mode = Mode::Commands;
 			match action {
-				Action::Continue(reply) => send(&mut writer, &reply).await?,
+				Action::Continue(reply) => send(&mut stream, &reply).await?,
 				Action::CollectData(reply) => {
 					mode = Mode::Data;
-					send(&mut writer, &reply).await?;
+					send(&mut stream, &reply).await?;
 				}
 				Action::Deliver(reply, message) => {
 					let reply = match self.sink.deliver(message) {
@@ -120,10 +165,27 @@ impl Server {
 							Reply::single(451, "temporary storage failure, try again")
 						}
 					};
-					send(&mut writer, &reply).await?;
+					send(&mut stream, &reply).await?;
+				}
+				Action::UpgradeTls(reply) => {
+					let Some(acceptor) = &self.tls else {
+						// The session only emits UpgradeTls when TLS was
+						// offered; reaching this is a programming error.
+						send(&mut stream, &Reply::single(454, "TLS not available")).await?;
+						return Ok(());
+					};
+					send(&mut stream, &reply).await?;
+					// Bytes received before the handshake are discarded:
+					// a pipelining client cannot smuggle plaintext commands
+					// into the TLS session.
+					let tls_stream = acceptor.accept(stream).await?;
+					stream = Box::new(tls_stream);
+					session.tls_started();
+					decoder = LineDecoder::new();
+					send(&mut stream, &session.greeting()).await?;
 				}
 				Action::Close(reply) => {
-					send(&mut writer, &reply).await?;
+					send(&mut stream, &reply).await?;
 					return Ok(());
 				}
 			}
@@ -143,7 +205,7 @@ fn line_error_reply(error: &LineError) -> Reply {
 
 async fn send<W>(writer: &mut W, reply: &Reply) -> std::io::Result<()>
 where
-	W: AsyncWrite + Unpin,
+	W: AsyncWrite + Unpin + ?Sized,
 {
 	writer.write_all(reply.to_string().as_bytes()).await?;
 	writer.flush().await
@@ -257,6 +319,132 @@ DATA\r\n\
 		let (output, sink) = converse(script).await;
 		assert!(output.contains("554 8-bit data"), "{output}");
 		assert!(sink.messages().is_empty());
+	}
+
+	#[tokio::test]
+	async fn starttls_not_offered_without_acceptor() {
+		let (output, _) = converse(b"EHLO client.example.org\r\nSTARTTLS\r\nQUIT\r\n").await;
+		assert!(!output.contains("250-STARTTLS"), "{output}");
+		assert!(output.contains("454 TLS not available"), "{output}");
+	}
+
+	/// Test client TLS connector trusting the given certificate.
+	fn test_connector(
+		cert: tokio_rustls::rustls::pki_types::CertificateDer<'static>,
+	) -> tokio_rustls::TlsConnector {
+		let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+		roots.add(cert).expect("trust test certificate");
+		let config = tokio_rustls::rustls::ClientConfig::builder()
+			.with_root_certificates(roots)
+			.with_no_client_auth();
+		tokio_rustls::TlsConnector::from(Arc::new(config))
+	}
+
+	async fn read_reply<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> String {
+		let mut buffer = [0u8; 1024];
+		let read = reader.read(&mut buffer).await.expect("read reply");
+		String::from_utf8_lossy(&buffer[..read]).to_string()
+	}
+
+	#[tokio::test]
+	async fn starttls_upgrade_and_transaction() {
+		let (acceptor, cert) = crate::tls::test_support::acceptor_and_cert();
+		let sink = Arc::new(MemorySink::new());
+		let server = Server::new("mail.example.org", sink.clone() as Arc<dyn MessageSink>)
+			.with_tls(acceptor, TlsMode::Opportunistic);
+
+		let (mut client, server_stream) = tokio::io::duplex(64 * 1024);
+		let task = tokio::spawn(async move { server.handle(server_stream).await });
+
+		assert!(read_reply(&mut client).await.starts_with("220 "));
+		client
+			.write_all(b"EHLO c.example.org\r\n")
+			.await
+			.expect("ehlo");
+		let ehlo = read_reply(&mut client).await;
+		assert!(ehlo.contains("250 STARTTLS"), "{ehlo}");
+
+		client.write_all(b"STARTTLS\r\n").await.expect("starttls");
+		assert!(read_reply(&mut client).await.starts_with("220 "));
+
+		// TLS handshake over the same stream.
+		let connector = test_connector(cert);
+		let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from("mail.example.org")
+			.expect("server name");
+		let mut tls_client = connector
+			.connect(server_name, client)
+			.await
+			.expect("tls handshake");
+
+		// Fresh greeting inside TLS; the session forgot the plaintext EHLO.
+		assert!(read_reply(&mut tls_client).await.starts_with("220 "));
+		tls_client
+			.write_all(b"EHLO c.example.org\r\n")
+			.await
+			.expect("tls ehlo");
+		let tls_ehlo = read_reply(&mut tls_client).await;
+		// STARTTLS must not be offered again inside TLS.
+		assert!(!tls_ehlo.contains("STARTTLS"), "{tls_ehlo}");
+
+		tls_client
+			.write_all(b"MAIL FROM:<a@example.org>\r\nRCPT TO:<b@example.org>\r\nDATA\r\n")
+			.await
+			.expect("transaction");
+		let mut got = String::new();
+		while !got.contains("354 ") {
+			got.push_str(&read_reply(&mut tls_client).await);
+		}
+		tls_client
+			.write_all(b"secret\r\n.\r\nQUIT\r\n")
+			.await
+			.expect("data");
+		let mut tail = String::new();
+		while !tail.contains("221 ") {
+			tail.push_str(&read_reply(&mut tls_client).await);
+		}
+
+		drop(tls_client);
+		task.abort();
+		let messages = sink.messages();
+		assert_eq!(messages.len(), 1);
+		assert_eq!(messages[0].data, b"secret\r\n");
+	}
+
+	#[tokio::test]
+	async fn implicit_tls_serves_inside_handshake() {
+		let (acceptor, cert) = crate::tls::test_support::acceptor_and_cert();
+		let sink = Arc::new(MemorySink::new());
+		let server = Server::new("mail.example.org", sink as Arc<dyn MessageSink>)
+			.with_tls(acceptor, TlsMode::Implicit);
+
+		let (client, server_stream) = tokio::io::duplex(64 * 1024);
+		let task = tokio::spawn(async move { server.handle(server_stream).await });
+
+		let connector = test_connector(cert);
+		let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from("mail.example.org")
+			.expect("server name");
+		let mut tls_client = connector
+			.connect(server_name, client)
+			.await
+			.expect("tls handshake");
+
+		assert!(read_reply(&mut tls_client).await.starts_with("220 "));
+		tls_client.write_all(b"QUIT\r\n").await.expect("quit");
+		assert!(read_reply(&mut tls_client).await.contains("221 "));
+		task.abort();
+	}
+
+	#[tokio::test]
+	async fn implicit_tls_without_acceptor_errors() {
+		let sink = Arc::new(MemorySink::new());
+		let server = Server {
+			hostname: "mail.example.org".to_string(),
+			sink: sink as Arc<dyn MessageSink>,
+			tls: None,
+			tls_mode: TlsMode::Implicit,
+		};
+		let (_client, server_stream) = tokio::io::duplex(1024);
+		assert!(server.handle(server_stream).await.is_err());
 	}
 
 	#[tokio::test]

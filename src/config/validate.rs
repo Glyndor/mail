@@ -66,6 +66,11 @@ impl Config {
 					"duplicate listener address {addr}"
 				)));
 			}
+			if listener.kind == crate::config::ListenerKind::Submissions && self.tls.is_none() {
+				return Err(ConfigError::Invalid(format!(
+					"listener {addr} is \"submissions\" (implicit TLS) but no [tls] section is configured"
+				)));
+			}
 		}
 		Ok(())
 	}
@@ -178,6 +183,38 @@ kind = "smtp"
 "#,
 		);
 		assert!(matches!(result, Err(ConfigError::Invalid(_))));
+	}
+
+	#[test]
+	fn rejects_submissions_listener_without_tls() {
+		let result = config_from(
+			r#"
+hostname = "mail.example.org"
+data_dir = "/var/lib/mail"
+
+[[listeners]]
+kind = "submissions"
+"#,
+		);
+		assert!(matches!(result, Err(ConfigError::Invalid(_))));
+	}
+
+	#[test]
+	fn accepts_submissions_listener_with_tls() {
+		let result = config_from(
+			r#"
+hostname = "mail.example.org"
+data_dir = "/var/lib/mail"
+
+[[listeners]]
+kind = "submissions"
+
+[tls]
+cert_file = "/etc/mail/cert.pem"
+key_file = "/etc/mail/key.pem"
+"#,
+		);
+		assert!(result.is_ok());
 	}
 
 	#[test]
