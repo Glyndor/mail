@@ -18,6 +18,8 @@ pub enum ListenerKind {
 	Submissions,
 	/// Management HTTP API.
 	Api,
+	/// IMAP over implicit TLS (port 993).
+	Imaps,
 }
 
 impl ListenerKind {
@@ -28,6 +30,7 @@ impl ListenerKind {
 			ListenerKind::Submission => 587,
 			ListenerKind::Submissions => 465,
 			ListenerKind::Api => 8025,
+			ListenerKind::Imaps => 993,
 		}
 	}
 }
