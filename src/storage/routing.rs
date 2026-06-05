@@ -12,11 +12,11 @@ use super::spool::FsSpool;
 
 /// Splits an accepted message between local mailbox delivery and the
 /// outbound spool, according to the directory.
-#[derive(Debug)]
 pub struct SplitDelivery {
 	directory: Arc<Directory>,
 	local: LocalDelivery,
 	outbound: FsSpool,
+	signer: Option<Arc<crate::dkim::Signer>>,
 }
 
 impl SplitDelivery {
@@ -26,7 +26,14 @@ impl SplitDelivery {
 			local: LocalDelivery::new(data_dir, Arc::clone(&directory))?,
 			outbound: FsSpool::open(data_dir)?,
 			directory,
+			signer: None,
 		})
+	}
+
+	/// Sign outbound messages with this DKIM signer.
+	pub fn with_signer(mut self, signer: Arc<crate::dkim::Signer>) -> Self {
+		self.signer = Some(signer);
+		self
 	}
 }
 
@@ -58,11 +65,21 @@ impl MessageSink for SplitDelivery {
 			})?;
 		}
 		if !remote.is_empty() {
+			let mut outbound_message = AcceptedMessage {
+				recipients: remote,
+				..message
+			};
+			// Sign relayed mail so receivers can verify our domain.
+			if let Some(signer) = &self.signer
+				&& let Some((_, domain)) = outbound_message.reverse_path.rsplit_once('@')
+				&& let Some(header) = signer.sign(domain, &outbound_message.data)
+			{
+				let mut signed = header.into_bytes();
+				signed.extend_from_slice(&outbound_message.data);
+				outbound_message.data = signed;
+			}
 			self.outbound
-				.store(&AcceptedMessage {
-					recipients: remote,
-					..message
-				})
+				.store(&outbound_message)
 				.map_err(|error| SinkError::Unavailable(error.to_string()))?;
 		}
 		Ok(())

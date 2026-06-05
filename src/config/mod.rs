@@ -5,11 +5,13 @@
 //! it, and any validation error aborts loading (fail closed).
 
 mod account;
+mod dkim;
 mod listener;
 mod tls;
 mod validate;
 
 pub use account::Account;
+pub use dkim::Dkim;
 pub use listener::{Listener, ListenerKind};
 pub use tls::Tls;
 
@@ -57,6 +59,8 @@ pub struct Config {
 	/// TLS material. Required by `submissions` listeners; enables STARTTLS
 	/// on `smtp` and `submission` listeners.
 	pub tls: Option<Tls>,
+	/// DKIM signing for outbound mail.
+	pub dkim: Option<Dkim>,
 }
 
 impl Config {

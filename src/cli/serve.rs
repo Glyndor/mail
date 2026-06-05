@@ -55,11 +55,14 @@ async fn serve(config: Config) -> std::io::Result<()> {
 	);
 
 	// Local recipients go to account mailboxes; authenticated relay mail
-	// is queued in the outbound spool.
-	let sink: Arc<dyn MessageSink> = Arc::new(SplitDelivery::new(
-		&config.data_dir,
-		Arc::clone(&directory),
-	)?);
+	// is queued in the outbound spool, DKIM-signed when configured.
+	let mut split = SplitDelivery::new(&config.data_dir, Arc::clone(&directory))?;
+	if let Some(dkim) = &config.dkim {
+		let signer = crate::dkim::Signer::load(&dkim.selector, &dkim.key_file)
+			.map_err(std::io::Error::other)?;
+		split = split.with_signer(Arc::new(signer));
+	}
+	let sink: Arc<dyn MessageSink> = Arc::new(split);
 
 	// SPF verification for unauthenticated inbound mail.
 	let spf_dns: Arc<dyn crate::spf::DnsLookup> = Arc::new(crate::spf::SystemDns::from_system()?);

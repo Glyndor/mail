@@ -32,6 +32,12 @@ enum Command {
 		#[arg(long, value_name = "FILE")]
 		config: PathBuf,
 	},
+	/// Generate an ed25519 DKIM key and print the DNS record value.
+	DkimKeygen {
+		/// Where to write the private key (PKCS#8 PEM).
+		#[arg(long, value_name = "FILE")]
+		out: PathBuf,
+	},
 }
 
 impl Cli {
@@ -55,8 +61,48 @@ impl Cli {
 					ExitCode::FAILURE
 				}
 			},
+			Command::DkimKeygen { out } => dkim_keygen(&out),
 		}
 	}
+}
+
+fn dkim_keygen(out: &std::path::Path) -> ExitCode {
+	if out.exists() {
+		eprintln!(
+			"error: {} already exists, refusing to overwrite",
+			out.display()
+		);
+		return ExitCode::FAILURE;
+	}
+	let (pem, record) = match crate::dkim::generate_key() {
+		Ok(generated) => generated,
+		Err(error) => {
+			eprintln!("error: {error}");
+			return ExitCode::FAILURE;
+		}
+	};
+	// The private key must never be group/world readable.
+	let result = {
+		use std::io::Write;
+		let mut options = std::fs::OpenOptions::new();
+		options.write(true).create_new(true);
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::OpenOptionsExt;
+			options.mode(0o600);
+		}
+		options
+			.open(out)
+			.and_then(|mut file| file.write_all(pem.as_bytes()))
+	};
+	if let Err(error) = result {
+		eprintln!("error: cannot write {}: {error}", out.display());
+		return ExitCode::FAILURE;
+	}
+	println!("private key written to {}", out.display());
+	println!("publish this TXT record at <selector>._domainkey.<your-domain>:");
+	println!("{record}");
+	ExitCode::SUCCESS
 }
 
 #[cfg(test)]
@@ -122,6 +168,53 @@ mod tests {
 		])
 		.expect("parses");
 		assert_eq!(cli.run(), ExitCode::FAILURE);
+	}
+
+	#[test]
+	fn dkim_keygen_writes_key_and_refuses_overwrite() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let out = dir.path().join("dkim.pem");
+		let cli = Cli::try_parse_from([
+			"mail",
+			"dkim-keygen",
+			"--out",
+			out.to_str().expect("utf-8 path"),
+		])
+		.expect("parses");
+		assert_eq!(cli.run(), ExitCode::SUCCESS);
+		let pem = std::fs::read_to_string(&out).expect("key written");
+		assert!(pem.starts_with("-----BEGIN PRIVATE KEY-----"));
+
+		// Second run must refuse to overwrite the existing key.
+		let cli = Cli::try_parse_from([
+			"mail",
+			"dkim-keygen",
+			"--out",
+			out.to_str().expect("utf-8 path"),
+		])
+		.expect("parses");
+		assert_eq!(cli.run(), ExitCode::FAILURE);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn dkim_keygen_sets_owner_only_permissions() {
+		use std::os::unix::fs::PermissionsExt;
+		let dir = tempfile::tempdir().expect("tempdir");
+		let out = dir.path().join("dkim.pem");
+		let cli = Cli::try_parse_from([
+			"mail",
+			"dkim-keygen",
+			"--out",
+			out.to_str().expect("utf-8 path"),
+		])
+		.expect("parses");
+		assert_eq!(cli.run(), ExitCode::SUCCESS);
+		let mode = std::fs::metadata(&out)
+			.expect("metadata")
+			.permissions()
+			.mode();
+		assert_eq!(mode & 0o777, 0o600);
 	}
 
 	#[test]
