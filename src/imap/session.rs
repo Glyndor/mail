@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::smtp::directory::Directory;
 
-use super::command::{Command, FetchItem, ParseError, StoreMode, Tagged};
+use super::command::{Command, FetchItem, ParseError, SearchKey, StoreMode, Tagged};
 use super::mailbox::{self, Flag, Snapshot, render_flags};
 
 /// Server output produced by one step: zero or more complete response
@@ -165,6 +165,7 @@ impl Session {
 				uid,
 				remove_source,
 			} => self.copy(&tag, &sequence, &mailbox, uid, remove_source),
+			Command::Search { criteria, uid } => self.search(&tag, &criteria, uid),
 		}
 	}
 
@@ -411,6 +412,53 @@ impl Session {
 		Output::text(response)
 	}
 
+	fn search(&mut self, tag: &str, criteria: &[SearchKey], uid: bool) -> Output {
+		let State::Selected { snapshot, .. } = &self.state else {
+			return Output::text(format!("{tag} BAD no mailbox selected\r\n"));
+		};
+
+		let total = u32::try_from(snapshot.len()).unwrap_or(u32::MAX);
+		let mut hits = Vec::new();
+		for sequence_number in 1..=total {
+			let Some(message) = snapshot.by_sequence(sequence_number) else {
+				continue;
+			};
+			// Message content loaded lazily: only for content criteria.
+			let mut content: Option<String> = None;
+			let load = |snapshot: &Snapshot| -> String {
+				snapshot
+					.read(message)
+					.map(|data| String::from_utf8_lossy(&data).to_ascii_lowercase())
+					.unwrap_or_default()
+			};
+
+			let matches = criteria.iter().all(|key| match key {
+				SearchKey::All => true,
+				SearchKey::FlagIs(flag, wanted) => message.flags.contains(flag) == *wanted,
+				SearchKey::Sequence(set) => set.contains(sequence_number, total),
+				SearchKey::UidSet(set) => set.contains(message.uid, total),
+				SearchKey::Header(name, needle) => {
+					let text = content.get_or_insert_with(|| load(snapshot));
+					header_value(text, name).is_some_and(|value| value.contains(needle.as_str()))
+				}
+				SearchKey::Text(needle) => {
+					let text = content.get_or_insert_with(|| load(snapshot));
+					text.contains(needle.as_str())
+				}
+			});
+			if matches {
+				hits.push(if uid { message.uid } else { sequence_number });
+			}
+		}
+
+		let mut response = String::from("* SEARCH");
+		for hit in hits {
+			response.push_str(&format!(" {hit}"));
+		}
+		response.push_str(&format!("\r\n{tag} OK SEARCH completed\r\n"));
+		Output::text(response)
+	}
+
 	fn expunge(&mut self, tag: &str) -> Output {
 		let State::Selected {
 			snapshot,
@@ -564,6 +612,34 @@ impl Session {
 			idle: false,
 		}
 	}
+}
+
+/// Extract a header value (lowercased input) from a lowercased message,
+/// folding included. `None` if the header is absent.
+fn header_value(lower_message: &str, name: &str) -> Option<String> {
+	let header_end = lower_message
+		.find("\r\n\r\n")
+		.unwrap_or(lower_message.len());
+	let headers = &lower_message[..header_end];
+	let mut value: Option<String> = None;
+	for line in headers.split("\r\n") {
+		if line.starts_with(' ') || line.starts_with('\t') {
+			if let Some(value) = &mut value {
+				value.push(' ');
+				value.push_str(line.trim());
+			}
+			continue;
+		}
+		if value.is_some() {
+			break;
+		}
+		if let Some(rest) = line.strip_prefix(name)
+			&& let Some(rest) = rest.strip_prefix(':')
+		{
+			value = Some(rest.trim().to_string());
+		}
+	}
+	value
 }
 
 #[cfg(test)]
@@ -980,6 +1056,71 @@ mod tests {
 		// Missing target answers TRYCREATE.
 		let output = session.command_line("a9 COPY 1 Nowhere");
 		assert!(text(&output).contains("TRYCREATE"), "{}", text(&output));
+	}
+
+	#[test]
+	fn search_by_flags_headers_and_text() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		deliver(
+			dir.path(),
+			b"From: alice@example.org\r\nSubject: project update\r\n\r\nquarterly numbers\r\n",
+		);
+		deliver(
+			dir.path(),
+			b"From: bob@example.org\r\nSubject: lunch\r\n\r\ntacos tomorrow\r\n",
+		);
+		let mut session = logged_in(dir.path());
+		session.command_line("a2 SELECT INBOX");
+		session.command_line(r"a3 STORE 1 +FLAGS (\Seen)");
+
+		let response = text(&session.command_line("a4 SEARCH UNSEEN"));
+		assert!(response.contains("* SEARCH 2\r\n"), "{response}");
+
+		let response = text(&session.command_line("a5 SEARCH FROM alice"));
+		assert!(response.contains("* SEARCH 1\r\n"), "{response}");
+
+		let response = text(&session.command_line(r#"a6 SEARCH SUBJECT "project update""#));
+		assert!(response.contains("* SEARCH 1\r\n"), "{response}");
+
+		let response = text(&session.command_line("a7 SEARCH TEXT tacos"));
+		assert!(response.contains("* SEARCH 2\r\n"), "{response}");
+
+		// AND semantics: seen + from alice = 1; unseen + from alice = none.
+		let response = text(&session.command_line("a8 SEARCH SEEN FROM alice"));
+		assert!(response.contains("* SEARCH 1\r\n"), "{response}");
+		let response = text(&session.command_line("a9 SEARCH UNSEEN FROM alice"));
+		assert!(response.contains("* SEARCH\r\n"), "{response}");
+
+		let response = text(&session.command_line("b1 SEARCH ALL"));
+		assert!(response.contains("* SEARCH 1 2\r\n"), "{response}");
+	}
+
+	#[test]
+	fn uid_search_returns_uids() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		deliver(dir.path(), b"From: a@x.example\r\n\r\none\r\n");
+		deliver(dir.path(), b"From: a@x.example\r\n\r\ntwo\r\n");
+		let mut session = logged_in(dir.path());
+		session.command_line("a2 SELECT INBOX");
+		session.command_line(r"a3 STORE 1 +FLAGS (\Deleted)");
+		session.command_line("a4 EXPUNGE");
+
+		// One message left: sequence 1, but UID 2.
+		let response = text(&session.command_line("a5 UID SEARCH ALL"));
+		assert!(response.contains("* SEARCH 2\r\n"), "{response}");
+		let response = text(&session.command_line("a6 SEARCH UID 2"));
+		assert!(response.contains("* SEARCH 1\r\n"), "{response}");
+	}
+
+	#[test]
+	fn search_requires_selection_and_valid_criteria() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let mut session = logged_in(dir.path());
+		let response = text(&session.command_line("a2 SEARCH ALL"));
+		assert!(response.contains("a2 BAD"), "{response}");
+		session.command_line("a3 SELECT INBOX");
+		let response = text(&session.command_line("a4 SEARCH BOGUSKEY"));
+		assert!(response.contains("a4 BAD"), "{response}");
 	}
 
 	#[test]

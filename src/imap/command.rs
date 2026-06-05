@@ -67,6 +67,26 @@ pub enum Command {
 		/// MOVE removes the source messages after copying.
 		remove_source: bool,
 	},
+	Search {
+		criteria: Vec<SearchKey>,
+		uid: bool,
+	},
+}
+
+/// A single SEARCH criterion; multiple keys AND together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchKey {
+	All,
+	/// Flag present (true) or absent (false).
+	FlagIs(super::mailbox::Flag, bool),
+	/// Header substring: (header name lowercased, needle lowercased).
+	Header(String, String),
+	/// Substring anywhere in the message (headers + body).
+	Text(String),
+	/// Explicit message sequence set.
+	Sequence(SequenceSet),
+	/// Explicit UID set (`UID <set>`).
+	UidSet(SequenceSet),
 }
 
 /// How STORE changes the flag set.
@@ -182,6 +202,7 @@ pub fn parse(line: &str) -> Result<Tagged, ParseError> {
 		"STORE" => parse_store(&tag, args, false)?,
 		"COPY" => parse_copy(&tag, args, false, false)?,
 		"MOVE" => parse_copy(&tag, args, false, true)?,
+		"SEARCH" => parse_search(&tag, args, false)?,
 		"UID" => {
 			let (sub, sub_args) = args
 				.split_once(' ')
@@ -194,6 +215,8 @@ pub fn parse(line: &str) -> Result<Tagged, ParseError> {
 				parse_copy(&tag, sub_args, true, false)?
 			} else if sub.eq_ignore_ascii_case("MOVE") {
 				parse_copy(&tag, sub_args, true, true)?
+			} else if sub.eq_ignore_ascii_case("SEARCH") {
+				parse_search(&tag, sub_args, true)?
 			} else {
 				return Err(ParseError::Unknown(tag));
 			}
@@ -355,6 +378,73 @@ fn parse_append(tag: &str, args: &str) -> Result<Command, ParseError> {
 		flags,
 		size,
 	})
+}
+
+fn parse_search(tag: &str, args: &str, uid: bool) -> Result<Command, ParseError> {
+	use crate::imap::mailbox::Flag;
+	let bad = || ParseError::BadArguments(tag.to_string());
+
+	let mut criteria = Vec::new();
+	let mut rest = args.trim();
+	while !rest.is_empty() {
+		let (word, after) = match rest.split_once(' ') {
+			Some((word, after)) => (word, after.trim_start()),
+			None => (rest, ""),
+		};
+		let upper = word.to_ascii_uppercase();
+		let key = match upper.as_str() {
+			"ALL" => {
+				rest = after;
+				criteria.push(SearchKey::All);
+				continue;
+			}
+			"SEEN" => SearchKey::FlagIs(Flag::Seen, true),
+			"UNSEEN" => SearchKey::FlagIs(Flag::Seen, false),
+			"DELETED" => SearchKey::FlagIs(Flag::Deleted, true),
+			"UNDELETED" => SearchKey::FlagIs(Flag::Deleted, false),
+			"FLAGGED" => SearchKey::FlagIs(Flag::Flagged, true),
+			"UNFLAGGED" => SearchKey::FlagIs(Flag::Flagged, false),
+			"ANSWERED" => SearchKey::FlagIs(Flag::Answered, true),
+			"UNANSWERED" => SearchKey::FlagIs(Flag::Answered, false),
+			"DRAFT" => SearchKey::FlagIs(Flag::Draft, true),
+			"UNDRAFT" => SearchKey::FlagIs(Flag::Draft, false),
+			"FROM" | "TO" | "SUBJECT" => {
+				let (needle, after_value) = parse_astring(after).ok_or_else(bad)?;
+				rest = after_value.trim_start();
+				criteria.push(SearchKey::Header(
+					upper.to_ascii_lowercase(),
+					needle.to_ascii_lowercase(),
+				));
+				continue;
+			}
+			"TEXT" => {
+				let (needle, after_value) = parse_astring(after).ok_or_else(bad)?;
+				rest = after_value.trim_start();
+				criteria.push(SearchKey::Text(needle.to_ascii_lowercase()));
+				continue;
+			}
+			"UID" => {
+				let (set_text, after_value) = match after.split_once(' ') {
+					Some((set_text, after_value)) => (set_text, after_value.trim_start()),
+					None => (after, ""),
+				};
+				let set = parse_sequence_set(set_text).ok_or_else(bad)?;
+				rest = after_value;
+				criteria.push(SearchKey::UidSet(set));
+				continue;
+			}
+			_ => match parse_sequence_set(word) {
+				Some(set) => SearchKey::Sequence(set),
+				None => return Err(bad()),
+			},
+		};
+		rest = after;
+		criteria.push(key);
+	}
+	if criteria.is_empty() {
+		return Err(bad());
+	}
+	Ok(Command::Search { criteria, uid })
 }
 
 fn parse_copy(
