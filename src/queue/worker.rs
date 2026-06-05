@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::smtp::address::Address;
 use crate::smtp::sink::MessageSink;
@@ -12,17 +12,30 @@ use super::client::{self, DeliveryError};
 use super::resolver::Connector;
 
 /// Maximum delivery attempts per spool entry before it is dropped.
-/// Attempt counting is in-memory for now; a restart starts over.
+/// Counts persist in the envelope, so restarts do not reset them.
 const MAX_ATTEMPTS: u32 = 10;
+
+/// Base retry delay; attempt n waits `base * 2^n`, capped at one hour.
+const BACKOFF_BASE_SECS: u64 = 60;
+const BACKOFF_CAP_SECS: u64 = 3600;
+
+/// When attempt number `attempts` may run, given the current time.
+fn backoff_until(now_epoch: u64, attempts: u32) -> u64 {
+	let delay = BACKOFF_BASE_SECS
+		.saturating_mul(1u64 << attempts.min(16))
+		.min(BACKOFF_CAP_SECS);
+	now_epoch.saturating_add(delay)
+}
 
 /// Outbound queue worker.
 pub struct Worker {
 	spool: FsSpool,
 	connector: Arc<dyn Connector>,
 	ehlo_hostname: String,
-	attempts: std::sync::Mutex<BTreeMap<uuid::Uuid, u32>>,
 	/// Where bounces are delivered. `None` drops them with a warning.
 	bounce_sink: Option<Arc<dyn MessageSink>>,
+	/// Test override for "now" (epoch seconds); 0 means the real clock.
+	clock: std::sync::atomic::AtomicU64,
 }
 
 impl Worker {
@@ -32,9 +45,26 @@ impl Worker {
 			spool,
 			connector,
 			ehlo_hostname: ehlo_hostname.to_string(),
-			attempts: std::sync::Mutex::new(BTreeMap::new()),
 			bounce_sink: None,
+			clock: std::sync::atomic::AtomicU64::new(0),
 		}
+	}
+
+	#[cfg(test)]
+	fn set_now(&self, epoch: u64) {
+		self.clock
+			.store(epoch, std::sync::atomic::Ordering::Relaxed);
+	}
+
+	fn now_epoch(&self) -> u64 {
+		let test_clock = self.clock.load(std::sync::atomic::Ordering::Relaxed);
+		if test_clock != 0 {
+			return test_clock;
+		}
+		SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.map(|d| d.as_secs())
+			.unwrap_or(0)
 	}
 
 	/// Deliver bounces for failed mail through this sink.
@@ -80,32 +110,40 @@ impl Worker {
 
 	/// One pass over the spool. Returns the number of delivered entries.
 	pub async fn pass(&self) -> std::io::Result<usize> {
+		let now = self.now_epoch();
 		let mut delivered = 0;
 		for id in self.spool.list()? {
+			// Skip entries whose backoff has not elapsed yet.
+			match self.spool.load(id) {
+				Ok(entry) if entry.envelope.next_attempt > now => continue,
+				Ok(_) => {}
+				// Vanished or unreadable: let deliver_entry classify it.
+				Err(_) => {}
+			}
 			match self.deliver_entry(id).await {
 				Outcome::Delivered => {
 					self.spool.remove(id)?;
-					self.attempts.lock().expect("attempts mutex").remove(&id);
 					delivered += 1;
 				}
 				Outcome::Dropped(reason) => {
 					tracing::warn!(%id, %reason, "dropping undeliverable message");
 					self.bounce(id, &reason);
 					self.spool.remove(id)?;
-					self.attempts.lock().expect("attempts mutex").remove(&id);
 				}
 				Outcome::Retry(reason) => {
-					let attempts = {
-						let mut attempts = self.attempts.lock().expect("attempts mutex");
-						let entry = attempts.entry(id).or_insert(0);
-						*entry += 1;
-						*entry
-					};
+					let prior = self
+						.spool
+						.load(id)
+						.map(|entry| entry.envelope.attempts)
+						.unwrap_or(MAX_ATTEMPTS);
+					let attempts = self
+						.spool
+						.record_attempt(id, backoff_until(now, prior + 1))
+						.unwrap_or(MAX_ATTEMPTS);
 					if attempts >= MAX_ATTEMPTS {
 						tracing::warn!(%id, %reason, attempts, "giving up on message");
 						self.bounce(id, &reason);
 						self.spool.remove(id)?;
-						self.attempts.lock().expect("attempts mutex").remove(&id);
 					} else {
 						tracing::debug!(%id, %reason, attempts, "delivery deferred");
 					}
@@ -287,7 +325,9 @@ mod tests {
 		let worker = Worker::new(spool, Arc::new(DownConnector), "mail.sender.example")
 			.with_bounce_sink(bounce_sink.clone() as Arc<dyn MessageSink>);
 
-		for _ in 0..MAX_ATTEMPTS {
+		for round in 0..MAX_ATTEMPTS {
+			// Jump past every backoff window so each pass really retries.
+			worker.set_now(1_000_000 + u64::from(round) * 10_000);
 			let _ = worker.pass().await.expect("pass");
 		}
 		assert!(worker.spool.list().expect("list").is_empty());
@@ -300,11 +340,16 @@ mod tests {
 		let spool = spool_with_message(dir.path(), "bob@remote.example");
 		let worker = Worker::new(spool, Arc::new(DownConnector), "mail.sender.example");
 
-		for _ in 0..MAX_ATTEMPTS - 1 {
+		for round in 0..MAX_ATTEMPTS - 1 {
+			worker.set_now(1_000_000 + u64::from(round) * 10_000);
 			assert_eq!(worker.pass().await.expect("pass"), 0);
 			assert_eq!(worker.spool.list().expect("list").len(), 1);
 		}
+		// Within the backoff window nothing is attempted.
+		assert_eq!(worker.pass().await.expect("pass"), 0);
+		assert_eq!(worker.spool.list().expect("list").len(), 1);
 		// The final attempt gives up and drops the entry.
+		worker.set_now(2_000_000);
 		assert_eq!(worker.pass().await.expect("pass"), 0);
 		assert!(worker.spool.list().expect("list").is_empty());
 	}
