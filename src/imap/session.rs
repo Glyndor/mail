@@ -68,7 +68,7 @@ pub struct Session {
 	idle_tag: Option<String>,
 }
 
-const CAPABILITIES: &str = "IMAP4rev2 AUTH=PLAIN";
+const CAPABILITIES: &str = "IMAP4rev2 AUTH=PLAIN MOVE";
 
 impl Session {
 	/// New session over an established TLS connection.
@@ -159,6 +159,12 @@ impl Session {
 				silent,
 				uid,
 			} => self.store(&tag, &sequence, mode, &flags, silent, uid),
+			Command::Copy {
+				sequence,
+				mailbox,
+				uid,
+				remove_source,
+			} => self.copy(&tag, &sequence, &mailbox, uid, remove_source),
 		}
 	}
 
@@ -333,6 +339,75 @@ impl Session {
 			}
 		}
 		response.push_str(&format!("{tag} OK STORE completed\r\n"));
+		Output::text(response)
+	}
+
+	fn copy(
+		&mut self,
+		tag: &str,
+		sequence: &super::command::SequenceSet,
+		target: &str,
+		uid: bool,
+		remove_source: bool,
+	) -> Output {
+		let data_dir = self.data_dir.clone();
+		let State::Selected {
+			account,
+			snapshot,
+			read_only,
+		} = &mut self.state
+		else {
+			return Output::text(format!("{tag} BAD no mailbox selected\r\n"));
+		};
+		if remove_source && *read_only {
+			return Output::text(format!("{tag} NO mailbox is read-only\r\n"));
+		}
+		let account = account.clone();
+		if !mailbox::exists(&data_dir, &account, target) {
+			return Output::text(format!("{tag} NO [TRYCREATE] no such mailbox\r\n"));
+		}
+
+		// Collect matching sequence numbers first: removal renumbers.
+		let total = u32::try_from(snapshot.len()).unwrap_or(u32::MAX);
+		let mut matched = Vec::new();
+		for sequence_number in 1..=total {
+			let Some(message) = snapshot.by_sequence(sequence_number) else {
+				continue;
+			};
+			let selector = if uid { message.uid } else { sequence_number };
+			if sequence.contains(selector, total) {
+				matched.push(sequence_number);
+			}
+		}
+
+		// Copy all before removing any: a failed copy must not lose mail.
+		for sequence_number in &matched {
+			let Some(message) = snapshot.by_sequence(*sequence_number) else {
+				return Output::text(format!("{tag} NO message vanished\r\n"));
+			};
+			let data = match snapshot.read(message) {
+				Ok(data) => data,
+				Err(_) => return Output::text(format!("{tag} NO message unavailable\r\n")),
+			};
+			if mailbox::append(&data_dir, &account, target, &message.flags, &data).is_err() {
+				return Output::text(format!("{tag} NO copy failed\r\n"));
+			}
+		}
+
+		let mut response = String::new();
+		if remove_source {
+			// Remove bottom-up so earlier sequence numbers stay valid, but
+			// emit EXPUNGE top-down with renumber-correct values.
+			for (offset, sequence_number) in matched.iter().enumerate() {
+				let current = sequence_number - u32::try_from(offset).unwrap_or(0);
+				if snapshot.remove_at(current).is_err() {
+					return Output::text(format!("{tag} NO move failed\r\n"));
+				}
+				response.push_str(&format!("* {current} EXPUNGE\r\n"));
+			}
+		}
+		let verb = if remove_source { "MOVE" } else { "COPY" };
+		response.push_str(&format!("{tag} OK {verb} completed\r\n"));
 		Output::text(response)
 	}
 
@@ -830,6 +905,81 @@ mod tests {
 		// Duplicate create fails.
 		session.command_line("a7 CREATE Drafts");
 		assert!(text(&session.command_line("a8 CREATE Drafts")).contains("a8 NO"));
+	}
+
+	#[test]
+	fn copy_preserves_source_and_flags() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		deliver(dir.path(), b"one\r\n");
+		let mut session = logged_in(dir.path());
+		session.command_line("a2 CREATE Archive");
+		session.command_line("a3 SELECT INBOX");
+		session.command_line(r"a4 STORE 1 +FLAGS (\Seen)");
+
+		let output = session.command_line("a5 COPY 1 Archive");
+		assert!(text(&output).contains("a5 OK COPY"), "{}", text(&output));
+
+		// Source intact.
+		let output = session.command_line("a6 FETCH 1 (FLAGS)");
+		assert!(text(&output).contains(r"FLAGS (\Seen)"));
+		session.command_line("a7 CLOSE");
+
+		// Target has the copy with flags.
+		let output = session.command_line("a8 SELECT Archive");
+		assert!(text(&output).contains("* 1 EXISTS"), "{}", text(&output));
+		let output = session.command_line("a9 FETCH 1 (FLAGS BODY[])");
+		let response = text(&output);
+		assert!(response.contains(r"FLAGS (\Seen)"), "{response}");
+		assert!(response.contains("one"), "{response}");
+	}
+
+	#[test]
+	fn move_removes_source_with_expunge() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		deliver(dir.path(), b"one\r\n");
+		deliver(dir.path(), b"two\r\n");
+		deliver(dir.path(), b"three\r\n");
+		let mut session = logged_in(dir.path());
+		session.command_line("a2 CREATE Trash");
+		session.command_line("a3 SELECT INBOX");
+
+		let output = session.command_line("a4 MOVE 1,3 Trash");
+		let response = text(&output);
+		// Renumbering: removing seq 1 makes old 3 the new 2.
+		assert!(response.contains("* 1 EXPUNGE"), "{response}");
+		assert!(response.contains("* 2 EXPUNGE"), "{response}");
+		assert!(response.contains("a4 OK MOVE"), "{response}");
+
+		let output = session.command_line("a5 FETCH 1 (BODY[])");
+		assert!(text(&output).contains("two"), "{}", text(&output));
+		session.command_line("a6 CLOSE");
+
+		let output = session.command_line("a7 SELECT Trash");
+		assert!(text(&output).contains("* 2 EXISTS"), "{}", text(&output));
+	}
+
+	#[test]
+	fn uid_move_and_guards() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		deliver(dir.path(), b"one\r\n");
+		let mut session = logged_in(dir.path());
+		session.command_line("a2 CREATE Trash");
+
+		// MOVE refused on read-only EXAMINE.
+		session.command_line("a3 EXAMINE INBOX");
+		let output = session.command_line("a4 MOVE 1 Trash");
+		assert!(text(&output).contains("a4 NO"), "{}", text(&output));
+		// COPY allowed on read-only.
+		let output = session.command_line("a5 COPY 1 Trash");
+		assert!(text(&output).contains("a5 OK"), "{}", text(&output));
+		session.command_line("a6 CLOSE");
+
+		session.command_line("a7 SELECT INBOX");
+		let output = session.command_line("a8 UID MOVE 1 Trash");
+		assert!(text(&output).contains("a8 OK MOVE"), "{}", text(&output));
+		// Missing target answers TRYCREATE.
+		let output = session.command_line("a9 COPY 1 Nowhere");
+		assert!(text(&output).contains("TRYCREATE"), "{}", text(&output));
 	}
 
 	#[test]

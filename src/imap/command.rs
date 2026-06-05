@@ -60,6 +60,13 @@ pub enum Command {
 		silent: bool,
 		uid: bool,
 	},
+	Copy {
+		sequence: SequenceSet,
+		mailbox: String,
+		uid: bool,
+		/// MOVE removes the source messages after copying.
+		remove_source: bool,
+	},
 }
 
 /// How STORE changes the flag set.
@@ -173,6 +180,8 @@ pub fn parse(line: &str) -> Result<Tagged, ParseError> {
 		"APPEND" => parse_append(&tag, args)?,
 		"FETCH" => parse_fetch(&tag, args, false)?,
 		"STORE" => parse_store(&tag, args, false)?,
+		"COPY" => parse_copy(&tag, args, false, false)?,
+		"MOVE" => parse_copy(&tag, args, false, true)?,
 		"UID" => {
 			let (sub, sub_args) = args
 				.split_once(' ')
@@ -181,6 +190,10 @@ pub fn parse(line: &str) -> Result<Tagged, ParseError> {
 				parse_fetch(&tag, sub_args, true)?
 			} else if sub.eq_ignore_ascii_case("STORE") {
 				parse_store(&tag, sub_args, true)?
+			} else if sub.eq_ignore_ascii_case("COPY") {
+				parse_copy(&tag, sub_args, true, false)?
+			} else if sub.eq_ignore_ascii_case("MOVE") {
+				parse_copy(&tag, sub_args, true, true)?
 			} else {
 				return Err(ParseError::Unknown(tag));
 			}
@@ -341,6 +354,27 @@ fn parse_append(tag: &str, args: &str) -> Result<Command, ParseError> {
 		mailbox,
 		flags,
 		size,
+	})
+}
+
+fn parse_copy(
+	tag: &str,
+	args: &str,
+	uid: bool,
+	remove_source: bool,
+) -> Result<Command, ParseError> {
+	let bad = || ParseError::BadArguments(tag.to_string());
+	let (sequence_text, mailbox_text) = args.split_once(' ').ok_or_else(bad)?;
+	let sequence = parse_sequence_set(sequence_text).ok_or_else(bad)?;
+	let (mailbox, rest) = parse_astring(mailbox_text).ok_or_else(bad)?;
+	if !rest.trim().is_empty() || mailbox.is_empty() {
+		return Err(bad());
+	}
+	Ok(Command::Copy {
+		sequence,
+		mailbox,
+		uid,
+		remove_source,
 	})
 }
 

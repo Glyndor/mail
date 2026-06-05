@@ -255,6 +255,20 @@ impl Snapshot {
 		Ok(&self.messages[index].flags)
 	}
 
+	/// Remove one message (file + sidecar) by sequence number.
+	pub fn remove_at(&mut self, sequence: u32) -> std::io::Result<()> {
+		let index = usize::try_from(sequence)
+			.ok()
+			.and_then(|s| s.checked_sub(1))
+			.filter(|index| *index < self.messages.len())
+			.ok_or_else(|| std::io::Error::other("no such message"))?;
+		let id = self.messages[index].id;
+		std::fs::remove_file(self.account_dir.join(format!("{id}.eml")))?;
+		let _ = std::fs::remove_file(self.account_dir.join(format!("{id}.flags")));
+		self.messages.remove(index);
+		Ok(())
+	}
+
 	/// Remove every `\Deleted` message (file + sidecar). Returns the
 	/// sequence numbers expunged, in the order responses must be sent
 	/// (each number is valid at the moment it is emitted).
