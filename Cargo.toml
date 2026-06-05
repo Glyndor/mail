@@ -10,7 +10,9 @@ publish = false
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
 toml = "1.1.2"
+tracing = "0.1.44"
 
 [profile.release]
 lto = "thin"
