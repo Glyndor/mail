@@ -1,4 +1,5 @@
-//! Filesystem-backed mailbox view: INBOX from `accounts/<name>/new/`.
+//! Filesystem-backed mailboxes: INBOX at `accounts/<name>/new/`, other
+//! mailboxes under `accounts/<name>/folders/<mailbox>/new/`.
 
 use std::path::{Path, PathBuf};
 
@@ -63,10 +64,104 @@ pub fn render_flags(flags: &[Flag]) -> String {
 	format!("({})", tokens.join(" "))
 }
 
+/// Whether a client-supplied mailbox name is safe and supported.
+pub fn valid_name(name: &str) -> bool {
+	!name.is_empty()
+		&& name.len() <= 128
+		&& !name.eq_ignore_ascii_case("INBOX")
+		&& name
+			.chars()
+			.all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'))
+		&& !name.starts_with('.')
+		&& !name.ends_with(' ')
+}
+
+/// The on-disk directory of a mailbox (its `new/` subdirectory).
+pub fn mailbox_dir(data_dir: &Path, account: &str, mailbox: &str) -> Option<PathBuf> {
+	let base = data_dir.join("accounts").join(account);
+	if mailbox.eq_ignore_ascii_case("INBOX") {
+		return Some(base.join("new"));
+	}
+	if !valid_name(mailbox) {
+		return None;
+	}
+	Some(base.join("folders").join(mailbox).join("new"))
+}
+
+/// Whether a mailbox exists. INBOX always exists.
+pub fn exists(data_dir: &Path, account: &str, mailbox: &str) -> bool {
+	if mailbox.eq_ignore_ascii_case("INBOX") {
+		return true;
+	}
+	mailbox_dir(data_dir, account, mailbox).is_some_and(|dir| dir.is_dir())
+}
+
+/// Create a mailbox. Fails if invalid or already existing.
+pub fn create(data_dir: &Path, account: &str, mailbox: &str) -> std::io::Result<()> {
+	let dir = mailbox_dir(data_dir, account, mailbox)
+		.filter(|_| !mailbox.eq_ignore_ascii_case("INBOX"))
+		.ok_or_else(|| std::io::Error::other("invalid mailbox name"))?;
+	if dir.is_dir() {
+		return Err(std::io::Error::other("mailbox already exists"));
+	}
+	std::fs::create_dir_all(&dir)
+}
+
+/// Delete a mailbox and its messages. INBOX cannot be deleted.
+pub fn delete(data_dir: &Path, account: &str, mailbox: &str) -> std::io::Result<()> {
+	if mailbox.eq_ignore_ascii_case("INBOX") || !valid_name(mailbox) {
+		return Err(std::io::Error::other("cannot delete this mailbox"));
+	}
+	let dir = data_dir
+		.join("accounts")
+		.join(account)
+		.join("folders")
+		.join(mailbox);
+	if !dir.is_dir() {
+		return Err(std::io::Error::other("no such mailbox"));
+	}
+	std::fs::remove_dir_all(dir)
+}
+
+/// Rename a mailbox. INBOX cannot be renamed.
+pub fn rename(data_dir: &Path, account: &str, from: &str, to: &str) -> std::io::Result<()> {
+	if from.eq_ignore_ascii_case("INBOX")
+		|| !valid_name(from)
+		|| !valid_name(to)
+		|| exists(data_dir, account, to)
+	{
+		return Err(std::io::Error::other("cannot rename"));
+	}
+	let folders = data_dir.join("accounts").join(account).join("folders");
+	if !folders.join(from).is_dir() {
+		return Err(std::io::Error::other("no such mailbox"));
+	}
+	std::fs::rename(folders.join(from), folders.join(to))
+}
+
+/// Existing mailbox names: INBOX plus folders, sorted.
+pub fn list(data_dir: &Path, account: &str) -> Vec<String> {
+	let mut names = vec!["INBOX".to_string()];
+	let folders = data_dir.join("accounts").join(account).join("folders");
+	if let Ok(entries) = std::fs::read_dir(folders) {
+		for entry in entries.flatten() {
+			if entry.path().is_dir()
+				&& let Some(name) = entry.file_name().to_str()
+				&& valid_name(name)
+			{
+				names.push(name.to_string());
+			}
+		}
+	}
+	names[1..].sort();
+	names
+}
+
 impl Snapshot {
-	/// Build the INBOX snapshot for an account under `data_dir`.
-	pub fn inbox(data_dir: &Path, account: &str) -> std::io::Result<Snapshot> {
-		let account_dir = data_dir.join("accounts").join(account).join("new");
+	/// Build the snapshot of any existing mailbox.
+	pub fn open(data_dir: &Path, account: &str, mailbox: &str) -> std::io::Result<Snapshot> {
+		let account_dir = mailbox_dir(data_dir, account, mailbox)
+			.ok_or_else(|| std::io::Error::other("invalid mailbox name"))?;
 		let mut ids: Vec<Uuid> = Vec::new();
 		match std::fs::read_dir(&account_dir) {
 			Ok(entries) => {
@@ -181,15 +276,17 @@ impl Snapshot {
 	}
 }
 
-/// Append a message to an account's INBOX crash-safely, with flags.
+/// Append a message to a mailbox crash-safely, with flags.
 /// Standalone because APPEND may target a mailbox that is not selected.
 pub fn append(
 	data_dir: &Path,
 	account: &str,
+	mailbox: &str,
 	flags: &[Flag],
 	data: &[u8],
 ) -> std::io::Result<Uuid> {
-	let account_dir = data_dir.join("accounts").join(account).join("new");
+	let account_dir = mailbox_dir(data_dir, account, mailbox)
+		.ok_or_else(|| std::io::Error::other("invalid mailbox name"))?;
 	let tmp_dir = data_dir.join("accounts").join(account).join("tmp");
 	std::fs::create_dir_all(&account_dir)?;
 	std::fs::create_dir_all(&tmp_dir)?;
@@ -233,7 +330,7 @@ mod tests {
 	#[test]
 	fn empty_or_missing_inbox_is_empty() {
 		let dir = tempfile::tempdir().expect("tempdir");
-		let snapshot = Snapshot::inbox(dir.path(), "alice").expect("snapshot");
+		let snapshot = Snapshot::open(dir.path(), "alice", "INBOX").expect("snapshot");
 		assert!(snapshot.is_empty());
 		assert_eq!(snapshot.uid_validity(), 1);
 		assert_eq!(snapshot.uid_next(), 1);
@@ -245,7 +342,7 @@ mod tests {
 		deliver(dir.path(), "alice", b"first\r\n");
 		deliver(dir.path(), "alice", b"second\r\n");
 
-		let snapshot = Snapshot::inbox(dir.path(), "alice").expect("snapshot");
+		let snapshot = Snapshot::open(dir.path(), "alice", "INBOX").expect("snapshot");
 		assert_eq!(snapshot.len(), 2);
 
 		let first = snapshot.by_sequence(1).expect("seq 1");
@@ -268,14 +365,14 @@ mod tests {
 		deliver(dir.path(), "alice", b"two\r\n");
 		deliver(dir.path(), "alice", b"three\r\n");
 
-		let mut snapshot = Snapshot::inbox(dir.path(), "alice").expect("snapshot");
+		let mut snapshot = Snapshot::open(dir.path(), "alice", "INBOX").expect("snapshot");
 		snapshot
 			.store_flags(1, vec![Flag::Seen, Flag::Deleted])
 			.expect("store");
 		snapshot.store_flags(3, vec![Flag::Deleted]).expect("store");
 
 		// A fresh snapshot reads the persisted flags.
-		let reloaded = Snapshot::inbox(dir.path(), "alice").expect("snapshot");
+		let reloaded = Snapshot::open(dir.path(), "alice", "INBOX").expect("snapshot");
 		assert_eq!(
 			reloaded.by_sequence(1).expect("seq 1").flags,
 			vec![Flag::Seen, Flag::Deleted]
@@ -295,7 +392,7 @@ mod tests {
 		);
 
 		// Files are gone on disk too.
-		let after = Snapshot::inbox(dir.path(), "alice").expect("snapshot");
+		let after = Snapshot::open(dir.path(), "alice", "INBOX").expect("snapshot");
 		assert_eq!(after.len(), 1);
 	}
 
@@ -303,7 +400,7 @@ mod tests {
 	fn store_flags_rejects_bad_sequence() {
 		let dir = tempfile::tempdir().expect("tempdir");
 		deliver(dir.path(), "alice", b"one\r\n");
-		let mut snapshot = Snapshot::inbox(dir.path(), "alice").expect("snapshot");
+		let mut snapshot = Snapshot::open(dir.path(), "alice", "INBOX").expect("snapshot");
 		assert!(snapshot.store_flags(0, vec![]).is_err());
 		assert!(snapshot.store_flags(2, vec![]).is_err());
 	}
@@ -321,12 +418,60 @@ mod tests {
 	}
 
 	#[test]
+	fn name_validation() {
+		assert!(valid_name("Sent"));
+		assert!(valid_name("My Folder.2024"));
+		assert!(!valid_name("INBOX"));
+		assert!(!valid_name("inbox"));
+		assert!(!valid_name("../up"));
+		assert!(!valid_name("a/b"));
+		assert!(!valid_name(".hidden"));
+		assert!(!valid_name(""));
+		assert!(!valid_name("trailing "));
+	}
+
+	#[test]
+	fn create_list_rename_delete_roundtrip() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		create(dir.path(), "alice", "Sent").expect("create");
+		assert!(exists(dir.path(), "alice", "Sent"));
+		assert!(create(dir.path(), "alice", "Sent").is_err());
+
+		append(dir.path(), "alice", "Sent", &[Flag::Seen], b"sent\r\n").expect("append");
+		let snapshot = Snapshot::open(dir.path(), "alice", "Sent").expect("open");
+		assert_eq!(snapshot.len(), 1);
+		assert_eq!(
+			snapshot.by_sequence(1).expect("seq").flags,
+			vec![Flag::Seen]
+		);
+
+		assert_eq!(list(dir.path(), "alice"), vec!["INBOX", "Sent"]);
+
+		rename(dir.path(), "alice", "Sent", "Outbox").expect("rename");
+		assert!(!exists(dir.path(), "alice", "Sent"));
+		assert!(exists(dir.path(), "alice", "Outbox"));
+
+		delete(dir.path(), "alice", "Outbox").expect("delete");
+		assert!(!exists(dir.path(), "alice", "Outbox"));
+		assert!(delete(dir.path(), "alice", "Outbox").is_err());
+	}
+
+	#[test]
+	fn inbox_is_protected() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		assert!(create(dir.path(), "alice", "INBOX").is_err());
+		assert!(delete(dir.path(), "alice", "INBOX").is_err());
+		assert!(rename(dir.path(), "alice", "INBOX", "X").is_err());
+		assert!(exists(dir.path(), "alice", "INBOX"));
+	}
+
+	#[test]
 	fn ignores_foreign_files() {
 		let dir = tempfile::tempdir().expect("tempdir");
 		deliver(dir.path(), "alice", b"mail\r\n");
 		std::fs::write(dir.path().join("accounts/alice/new/notes.txt"), b"not mail")
 			.expect("write");
-		let snapshot = Snapshot::inbox(dir.path(), "alice").expect("snapshot");
+		let snapshot = Snapshot::open(dir.path(), "alice", "INBOX").expect("snapshot");
 		assert_eq!(snapshot.len(), 1);
 	}
 }
