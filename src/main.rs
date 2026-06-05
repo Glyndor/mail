@@ -1,23 +1,7 @@
-fn main() {
-	println!("{}", version());
-}
+use std::process::ExitCode;
 
-/// Human-readable version line, used by `main` and (later) the CLI.
-fn version() -> String {
-	format!("mail {}", env!("CARGO_PKG_VERSION"))
-}
+use clap::Parser;
 
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn version_includes_package_version() {
-		assert_eq!(version(), format!("mail {}", env!("CARGO_PKG_VERSION")));
-	}
-
-	#[test]
-	fn main_prints_version() {
-		main();
-	}
+fn main() -> ExitCode {
+	mail::cli::Cli::parse().run()
 }
