@@ -7,7 +7,9 @@
 //! default install must work with zero external services.
 
 mod delivery;
+mod routing;
 mod spool;
 
 pub use delivery::LocalDelivery;
+pub use routing::SplitDelivery;
 pub use spool::{Envelope, FsSpool, SpoolEntry};
