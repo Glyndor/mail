@@ -25,6 +25,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Connection for T {}
 enum Mode {
 	Commands,
 	Data,
+	Auth,
 }
 
 /// How a listener treats TLS.
@@ -161,6 +162,9 @@ impl Server {
 			let action = match mode {
 				Mode::Commands => Some(session.command_line(&line)),
 				Mode::Data => session.data_line(&line),
+				// Argon2 verification is CPU-bound; acceptable inline while
+				// per-connection rate limiting keeps attempts scarce.
+				Mode::Auth => Some(session.auth_line(&line)),
 			};
 			let Some(action) = action else {
 				continue;
@@ -171,6 +175,10 @@ impl Server {
 				Action::Continue(reply) => send(&mut stream, &reply).await?,
 				Action::CollectData(reply) => {
 					mode = Mode::Data;
+					send(&mut stream, &reply).await?;
+				}
+				Action::CollectAuthResponse(reply) => {
+					mode = Mode::Auth;
 					send(&mut stream, &reply).await?;
 				}
 				Action::Deliver(reply, mut message) => {

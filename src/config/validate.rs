@@ -48,6 +48,15 @@ impl Config {
 					"account \"{name}\" has no addresses"
 				)));
 			}
+			if let Some(hash) = &account.password_hash {
+				let argon2id = hash.starts_with("$argon2id$")
+					&& argon2::password_hash::PasswordHash::new(hash).is_ok();
+				if !argon2id {
+					return Err(ConfigError::Invalid(format!(
+						"account \"{name}\": password_hash must be an argon2id PHC string"
+					)));
+				}
+			}
 			for raw in &account.addresses {
 				let address = crate::smtp::address::Address::parse(raw).map_err(|_| {
 					ConfigError::Invalid(format!("account \"{name}\": invalid address \"{raw}\""))

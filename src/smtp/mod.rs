@@ -4,6 +4,7 @@
 //! `session` drives the per-connection state machine.
 
 pub mod address;
+pub mod auth;
 pub mod command;
 pub mod directory;
 pub mod line;

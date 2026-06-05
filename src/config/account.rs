@@ -10,6 +10,9 @@ pub struct Account {
 	pub name: String,
 	/// Addresses delivered to this account.
 	pub addresses: Vec<String>,
+	/// argon2id password hash (PHC string). Without it the account is
+	/// receive-only and cannot authenticate.
+	pub password_hash: Option<String>,
 }
 
 #[cfg(test)]

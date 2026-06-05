@@ -36,6 +36,11 @@ pub enum Command {
 	Vrfy,
 	/// `STARTTLS`
 	StartTls,
+	/// `AUTH <mechanism> [initial-response]` (RFC 4954)
+	Auth {
+		mechanism: String,
+		initial: Option<String>,
+	},
 }
 
 /// `BODY=` parameter values (RFC 6152).
@@ -100,8 +105,36 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
 		"QUIT" => parse_no_args(args, Command::Quit),
 		"VRFY" => Ok(Command::Vrfy),
 		"STARTTLS" => parse_no_args(args, Command::StartTls),
+		"AUTH" => parse_auth(args),
 		_ => Err(ParseError::UnknownCommand),
 	}
+}
+
+/// Parse `AUTH <mechanism> [initial-response]`. An initial response of `=`
+/// means an empty response (RFC 4954 section 4).
+fn parse_auth(args: &str) -> Result<Command, ParseError> {
+	let mut parts = args.split_ascii_whitespace();
+	let mechanism = parts.next().ok_or(ParseError::InvalidArguments)?;
+	let initial = parts.next();
+	if parts.next().is_some() {
+		return Err(ParseError::InvalidArguments);
+	}
+	let valid_mech = mechanism
+		.chars()
+		.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+	if !valid_mech {
+		return Err(ParseError::InvalidArguments);
+	}
+	Ok(Command::Auth {
+		mechanism: mechanism.to_ascii_uppercase(),
+		initial: initial.map(|i| {
+			if i == "=" {
+				String::new()
+			} else {
+				i.to_string()
+			}
+		}),
+	})
 }
 
 fn parse_no_args(args: &str, command: Command) -> Result<Command, ParseError> {
@@ -344,6 +377,41 @@ mod tests {
 	fn vrfy_parses_regardless_of_argument() {
 		assert_eq!(parse("VRFY alice"), Ok(Command::Vrfy));
 		assert_eq!(parse("VRFY"), Ok(Command::Vrfy));
+	}
+
+	#[test]
+	fn parses_auth_with_and_without_initial_response() {
+		assert_eq!(
+			parse("AUTH PLAIN dGVzdA=="),
+			Ok(Command::Auth {
+				mechanism: "PLAIN".into(),
+				initial: Some("dGVzdA==".into())
+			})
+		);
+		assert_eq!(
+			parse("auth plain"),
+			Ok(Command::Auth {
+				mechanism: "PLAIN".into(),
+				initial: None
+			})
+		);
+		assert_eq!(
+			parse("AUTH PLAIN ="),
+			Ok(Command::Auth {
+				mechanism: "PLAIN".into(),
+				initial: Some(String::new())
+			})
+		);
+	}
+
+	#[test]
+	fn rejects_malformed_auth() {
+		assert_eq!(parse("AUTH"), Err(ParseError::InvalidArguments));
+		assert_eq!(parse("AUTH PLAIN a b"), Err(ParseError::InvalidArguments));
+		assert_eq!(
+			parse("AUTH PL@IN dGVzdA=="),
+			Err(ParseError::InvalidArguments)
+		);
 	}
 
 	#[test]

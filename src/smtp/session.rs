@@ -54,6 +54,8 @@ pub enum Action {
 	Deliver(Reply, AcceptedMessage),
 	/// Send the reply, then upgrade the connection to TLS (RFC 3207).
 	UpgradeTls(Reply),
+	/// Send the 334 challenge and read one authentication response line.
+	CollectAuthResponse(Reply),
 	/// Send the reply and close the connection.
 	Close(Reply),
 }
@@ -67,6 +69,10 @@ pub struct Session {
 	tls_available: bool,
 	/// Whether the connection is already inside TLS.
 	tls_active: bool,
+	/// Account name once AUTH succeeded.
+	authenticated: Option<String>,
+	/// Failed authentication attempts on this connection.
+	auth_failures: u8,
 	/// The domain the client announced in HELO/EHLO, for trace headers.
 	helo_domain: Option<String>,
 	/// Recipient resolution. An empty directory rejects every recipient
@@ -82,9 +88,16 @@ impl Session {
 			state: State::Connected,
 			tls_available: false,
 			tls_active: false,
+			authenticated: None,
+			auth_failures: 0,
 			helo_domain: None,
 			directory: Arc::new(Directory::default()),
 		}
+	}
+
+	/// The authenticated account, if AUTH succeeded.
+	pub fn authenticated(&self) -> Option<&str> {
+		self.authenticated.as_deref()
 	}
 
 	/// Mark this session as running inside TLS from the start
@@ -163,7 +176,66 @@ impl Session {
 			Command::Quit => Action::Close(Reply::closing()),
 			Command::Vrfy => Action::Continue(Reply::vrfy_not_disclosed()),
 			Command::StartTls => self.start_tls(),
+			Command::Auth { mechanism, initial } => self.auth(&mechanism, initial),
 		}
+	}
+
+	fn auth(&mut self, mechanism: &str, initial: Option<String>) -> Action {
+		if !self.tls_active {
+			// Credentials never cross plaintext.
+			return Action::Continue(Reply::single(
+				538,
+				"5.7.11 encryption required for authentication",
+			));
+		}
+		if self.authenticated.is_some() {
+			return Action::Continue(Reply::bad_sequence());
+		}
+		if self.state != State::Greeted {
+			return Action::Continue(Reply::bad_sequence());
+		}
+		if mechanism != "PLAIN" {
+			return Action::Continue(Reply::single(504, "mechanism not supported"));
+		}
+		match initial {
+			Some(response) => self.verify_plain(&response),
+			None => Action::CollectAuthResponse(Reply::single(334, "")),
+		}
+	}
+
+	/// Feed the response line of a challenged AUTH (server sent 334).
+	pub fn auth_line(&mut self, line: &str) -> Action {
+		if line == "*" {
+			return Action::Continue(Reply::single(501, "authentication cancelled"));
+		}
+		self.verify_plain(line)
+	}
+
+	fn verify_plain(&mut self, encoded: &str) -> Action {
+		use super::auth::{parse_plain, verify_password};
+
+		let failure = |session: &mut Session| {
+			session.auth_failures += 1;
+			let reply = Reply::single(535, "5.7.8 authentication credentials invalid");
+			if session.auth_failures >= 3 {
+				Action::Close(reply)
+			} else {
+				Action::Continue(reply)
+			}
+		};
+
+		let Ok(credentials) = parse_plain(encoded) else {
+			return failure(self);
+		};
+		let Some((account, hash)) = self.directory.credentials(&credentials.authcid) else {
+			// Unknown user: same reply as a bad password, no oracle.
+			return failure(self);
+		};
+		if !verify_password(hash, &credentials.password) {
+			return failure(self);
+		}
+		self.authenticated = Some(account);
+		Action::Continue(Reply::single(235, "2.7.0 authentication successful"))
 	}
 
 	fn greet(&mut self, domain: String) -> Action {
@@ -177,6 +249,9 @@ impl Session {
 		];
 		if self.tls_available {
 			lines.push("STARTTLS".to_string());
+		}
+		if self.tls_active && self.authenticated.is_none() {
+			lines.push("AUTH PLAIN".to_string());
 		}
 		Action::Continue(Reply::new(250, lines))
 	}
@@ -337,6 +412,7 @@ mod tests {
 			Action::Continue(r)
 			| Action::CollectData(r)
 			| Action::UpgradeTls(r)
+			| Action::CollectAuthResponse(r)
 			| Action::Close(r) => r.code(),
 			Action::Deliver(r, _) => r.code(),
 		}
@@ -534,6 +610,140 @@ mod tests {
 		let mut session = greeted();
 		let action = session.command_line("MAIL FROM:<a@example.org> AUTH=<>");
 		assert_eq!(reply_code(&action), 555);
+	}
+
+	fn auth_directory() -> Arc<Directory> {
+		Arc::new(
+			Directory::new(
+				["example.org".to_string()],
+				[("alice@example.org".to_string(), "alice".to_string())],
+			)
+			.with_password_hashes([(
+				"alice".to_string(),
+				crate::smtp::auth::tests::hash("secret"),
+			)]),
+		)
+	}
+
+	fn plain(authcid: &str, password: &str) -> String {
+		use base64::Engine;
+		base64::engine::general_purpose::STANDARD.encode(format!("\0{authcid}\0{password}"))
+	}
+
+	fn tls_session() -> Session {
+		let mut session = Session::new("mail.example.org")
+			.with_directory(auth_directory())
+			.with_tls_active();
+		session.command_line("EHLO client.example.org");
+		session
+	}
+
+	#[test]
+	fn auth_rejected_outside_tls() {
+		let mut session = greeted();
+		let action = session.command_line(&format!("AUTH PLAIN {}", plain("alice", "secret")));
+		assert_eq!(reply_code(&action), 538);
+		assert_eq!(session.authenticated(), None);
+	}
+
+	#[test]
+	fn ehlo_advertises_auth_only_inside_tls() {
+		let mut plain_session = greeted();
+		let Action::Continue(reply) = plain_session.command_line("EHLO c.example.org") else {
+			panic!("expected continue");
+		};
+		assert!(!reply.to_string().contains("AUTH PLAIN"));
+
+		let mut tls = tls_session();
+		let Action::Continue(reply) = tls.command_line("EHLO c.example.org") else {
+			panic!("expected continue");
+		};
+		assert!(reply.to_string().contains("AUTH PLAIN"), "{reply}");
+	}
+
+	#[test]
+	fn auth_with_initial_response_succeeds() {
+		let mut session = tls_session();
+		let action = session.command_line(&format!("AUTH PLAIN {}", plain("alice", "secret")));
+		assert_eq!(reply_code(&action), 235);
+		assert_eq!(session.authenticated(), Some("alice"));
+	}
+
+	#[test]
+	fn auth_by_address_succeeds() {
+		let mut session = tls_session();
+		let action = session.command_line(&format!(
+			"AUTH PLAIN {}",
+			plain("alice@example.org", "secret")
+		));
+		assert_eq!(reply_code(&action), 235);
+	}
+
+	#[test]
+	fn auth_challenge_flow_succeeds() {
+		let mut session = tls_session();
+		let action = session.command_line("AUTH PLAIN");
+		assert!(matches!(action, Action::CollectAuthResponse(_)));
+		assert_eq!(reply_code(&action), 334);
+		let action = session.auth_line(&plain("alice", "secret"));
+		assert_eq!(reply_code(&action), 235);
+	}
+
+	#[test]
+	fn auth_challenge_can_be_cancelled() {
+		let mut session = tls_session();
+		session.command_line("AUTH PLAIN");
+		let action = session.auth_line("*");
+		assert_eq!(reply_code(&action), 501);
+		assert_eq!(session.authenticated(), None);
+	}
+
+	#[test]
+	fn wrong_password_gets_535_without_detail() {
+		let mut session = tls_session();
+		let action = session.command_line(&format!("AUTH PLAIN {}", plain("alice", "wrong")));
+		assert_eq!(reply_code(&action), 535);
+		assert_eq!(session.authenticated(), None);
+	}
+
+	#[test]
+	fn unknown_user_gets_same_reply_as_wrong_password() {
+		let mut session = tls_session();
+		let action = session.command_line(&format!("AUTH PLAIN {}", plain("mallory", "secret")));
+		assert_eq!(reply_code(&action), 535);
+	}
+
+	#[test]
+	fn third_failure_closes_connection() {
+		let mut session = tls_session();
+		for _ in 0..2 {
+			let action = session.command_line(&format!("AUTH PLAIN {}", plain("alice", "wrong")));
+			assert!(matches!(action, Action::Continue(_)));
+		}
+		let action = session.command_line(&format!("AUTH PLAIN {}", plain("alice", "wrong")));
+		assert!(matches!(action, Action::Close(_)));
+	}
+
+	#[test]
+	fn auth_after_success_is_bad_sequence() {
+		let mut session = tls_session();
+		session.command_line(&format!("AUTH PLAIN {}", plain("alice", "secret")));
+		let action = session.command_line(&format!("AUTH PLAIN {}", plain("alice", "secret")));
+		assert_eq!(reply_code(&action), 503);
+	}
+
+	#[test]
+	fn unsupported_mechanism_gets_504() {
+		let mut session = tls_session();
+		assert_eq!(reply_code(&session.command_line("AUTH LOGIN")), 504);
+	}
+
+	#[test]
+	fn auth_inside_transaction_is_bad_sequence() {
+		let mut session = tls_session();
+		session.command_line("MAIL FROM:<alice@example.org>");
+		let action = session.command_line(&format!("AUTH PLAIN {}", plain("alice", "secret")));
+		assert_eq!(reply_code(&action), 503);
 	}
 
 	#[test]

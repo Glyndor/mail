@@ -35,16 +35,24 @@ async fn serve(config: Config) -> std::io::Result<()> {
 		return Ok(());
 	}
 
-	// Recipient resolution shared by sessions and delivery.
-	let directory = Arc::new(Directory::new(
-		config.domains.iter().cloned(),
-		config.accounts.iter().flat_map(|account| {
+	// Recipient resolution and credentials shared by sessions and delivery.
+	let directory = Arc::new(
+		Directory::new(
+			config.domains.iter().cloned(),
+			config.accounts.iter().flat_map(|account| {
+				account
+					.addresses
+					.iter()
+					.map(|address| (address.clone(), account.name.clone()))
+			}),
+		)
+		.with_password_hashes(config.accounts.iter().filter_map(|account| {
 			account
-				.addresses
-				.iter()
-				.map(|address| (address.clone(), account.name.clone()))
-		}),
-	));
+				.password_hash
+				.as_ref()
+				.map(|hash| (account.name.clone(), hash.clone()))
+		})),
+	);
 
 	// Accepted inbound mail is delivered to account mailboxes.
 	let sink: Arc<dyn MessageSink> = Arc::new(LocalDelivery::new(

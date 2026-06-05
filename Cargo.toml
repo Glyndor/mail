@@ -8,6 +8,8 @@ repository = "https://github.com/Glyndor/mail"
 publish = false
 
 [dependencies]
+argon2 = "0.5.3"
+base64 = "0.22.1"
 clap = { version = "4.6.1", features = ["derive"] }
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
