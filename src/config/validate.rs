@@ -8,38 +8,28 @@ impl Config {
 	/// Validate the configuration. Any violation is an error: the server
 	/// refuses to start rather than run with a questionable setup.
 	pub(super) fn validate(&self) -> Result<(), ConfigError> {
-		self.validate_hostname()?;
+		validate_dns_name("hostname", &self.hostname)?;
 		self.validate_data_dir()?;
+		self.validate_domains()?;
 		self.validate_listeners()?;
 		Ok(())
 	}
 
-	fn validate_hostname(&self) -> Result<(), ConfigError> {
-		let hostname = self.hostname.trim();
-		if hostname.is_empty() {
-			return Err(ConfigError::Invalid("hostname must not be empty".into()));
+	fn validate_domains(&self) -> Result<(), ConfigError> {
+		if !self.listeners.is_empty() && self.domains.is_empty() {
+			return Err(ConfigError::Invalid(
+				"at least one entry in \"domains\" is required when listeners are configured"
+					.into(),
+			));
 		}
-		if !hostname.contains('.') {
-			return Err(ConfigError::Invalid(format!(
-				"hostname \"{hostname}\" must be fully qualified (contain a dot)"
-			)));
-		}
-		if hostname.len() > 253
-			|| hostname
-				.split('.')
-				.any(|label| label.is_empty() || label.len() > 63)
-		{
-			return Err(ConfigError::Invalid(format!(
-				"hostname \"{hostname}\" is not a valid DNS name"
-			)));
-		}
-		let valid_chars = hostname
-			.chars()
-			.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
-		if !valid_chars {
-			return Err(ConfigError::Invalid(format!(
-				"hostname \"{hostname}\" contains invalid characters"
-			)));
+		let mut seen = HashSet::new();
+		for domain in &self.domains {
+			validate_dns_name("domain", domain)?;
+			if !seen.insert(domain.to_ascii_lowercase()) {
+				return Err(ConfigError::Invalid(format!(
+					"duplicate domain \"{domain}\""
+				)));
+			}
 		}
 		Ok(())
 	}
@@ -76,6 +66,37 @@ impl Config {
 	}
 }
 
+/// Validate a fully qualified DNS name; `field` names it in errors.
+fn validate_dns_name(field: &str, name: &str) -> Result<(), ConfigError> {
+	let name = name.trim();
+	if name.is_empty() {
+		return Err(ConfigError::Invalid(format!("{field} must not be empty")));
+	}
+	if !name.contains('.') {
+		return Err(ConfigError::Invalid(format!(
+			"{field} \"{name}\" must be fully qualified (contain a dot)"
+		)));
+	}
+	if name.len() > 253
+		|| name
+			.split('.')
+			.any(|label| label.is_empty() || label.len() > 63)
+	{
+		return Err(ConfigError::Invalid(format!(
+			"{field} \"{name}\" is not a valid DNS name"
+		)));
+	}
+	let valid_chars = name
+		.chars()
+		.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+	if !valid_chars {
+		return Err(ConfigError::Invalid(format!(
+			"{field} \"{name}\" contains invalid characters"
+		)));
+	}
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -93,6 +114,7 @@ mod tests {
 			r#"
 hostname = "mail.example.org"
 data_dir = "/var/lib/mail"
+domains = ["example.org"]
 
 [[listeners]]
 kind = "smtp"
@@ -174,6 +196,7 @@ data_dir = "relative/path"
 			r#"
 hostname = "mail.example.org"
 data_dir = "/var/lib/mail"
+domains = ["example.org"]
 
 [[listeners]]
 kind = "smtp"
@@ -191,6 +214,7 @@ kind = "smtp"
 			r#"
 hostname = "mail.example.org"
 data_dir = "/var/lib/mail"
+domains = ["example.org"]
 
 [[listeners]]
 kind = "submissions"
@@ -205,6 +229,7 @@ kind = "submissions"
 			r#"
 hostname = "mail.example.org"
 data_dir = "/var/lib/mail"
+domains = ["example.org"]
 
 [[listeners]]
 kind = "submissions"
@@ -218,11 +243,50 @@ key_file = "/etc/mail/key.pem"
 	}
 
 	#[test]
+	fn rejects_listeners_without_domains() {
+		let result = config_from(
+			r#"
+hostname = "mail.example.org"
+data_dir = "/var/lib/mail"
+
+[[listeners]]
+kind = "smtp"
+"#,
+		);
+		assert!(matches!(result, Err(ConfigError::Invalid(_))));
+	}
+
+	#[test]
+	fn rejects_invalid_domain_entry() {
+		let result = config_from(
+			r#"
+hostname = "mail.example.org"
+data_dir = "/var/lib/mail"
+domains = ["nodot"]
+"#,
+		);
+		assert!(matches!(result, Err(ConfigError::Invalid(_))));
+	}
+
+	#[test]
+	fn rejects_duplicate_domains_case_insensitively() {
+		let result = config_from(
+			r#"
+hostname = "mail.example.org"
+data_dir = "/var/lib/mail"
+domains = ["example.org", "EXAMPLE.org"]
+"#,
+		);
+		assert!(matches!(result, Err(ConfigError::Invalid(_))));
+	}
+
+	#[test]
 	fn accepts_same_port_on_different_addresses() {
 		let result = config_from(
 			r#"
 hostname = "mail.example.org"
 data_dir = "/var/lib/mail"
+domains = ["example.org"]
 
 [[listeners]]
 kind = "smtp"

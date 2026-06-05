@@ -4,6 +4,10 @@
 //! produces replies plus completed messages. The network layer owns sockets
 //! and feeds this machine, which keeps the protocol logic fully unit-testable.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use super::address::Address;
 use super::command::{Command, ParseError};
 use super::reply::Reply;
 
@@ -61,6 +65,9 @@ pub struct Session {
 	state: State,
 	/// Whether STARTTLS can be offered (TLS configured, not yet active).
 	tls_available: bool,
+	/// Lowercased domains this server accepts mail for. Empty set means
+	/// every recipient is rejected (fail closed).
+	local_domains: Arc<HashSet<String>>,
 }
 
 impl Session {
@@ -70,7 +77,14 @@ impl Session {
 			hostname: hostname.to_string(),
 			state: State::Connected,
 			tls_available: false,
+			local_domains: Arc::new(HashSet::new()),
 		}
+	}
+
+	/// Set the domains this session accepts recipients for.
+	pub fn with_local_domains(mut self, domains: Arc<HashSet<String>>) -> Self {
+		self.local_domains = domains;
+		self
 	}
 
 	/// Offer STARTTLS on this session.
@@ -155,6 +169,11 @@ impl Session {
 	fn mail_from(&mut self, reverse_path: String, size: Option<u64>) -> Action {
 		match self.state {
 			State::Greeted => {
+				// The null reverse-path (bounces) is legal; anything else
+				// must be a syntactically valid address.
+				if !reverse_path.is_empty() && Address::parse(&reverse_path).is_err() {
+					return Action::Continue(Reply::single(553, "invalid reverse-path"));
+				}
 				// SIZE is declared up front: reject oversize without DATA.
 				if size.is_some_and(|s| s > MAX_MESSAGE_SIZE as u64) {
 					return Action::Continue(Reply::single(552, "message exceeds maximum size"));
@@ -167,9 +186,14 @@ impl Session {
 	}
 
 	fn rcpt_to(&mut self, forward_path: String) -> Action {
-		if forward_path.is_empty() {
-			return Action::Continue(Reply::invalid_arguments());
+		let Ok(address) = Address::parse(&forward_path) else {
+			return Action::Continue(Reply::single(553, "invalid recipient address"));
+		};
+		if !self.local_domains.contains(address.domain()) {
+			// Not one of our domains: this server does not relay.
+			return Action::Continue(Reply::single(550, "5.7.1 relaying denied"));
 		}
+		let forward_path = address.to_string();
 		match &mut self.state {
 			State::ReceivingRecipients { reverse_path } => {
 				let reverse_path = reverse_path.clone();
@@ -257,8 +281,12 @@ impl Session {
 mod tests {
 	use super::*;
 
+	fn test_domains() -> Arc<HashSet<String>> {
+		Arc::new(HashSet::from(["example.org".to_string()]))
+	}
+
 	fn greeted() -> Session {
-		let mut session = Session::new("mail.example.org");
+		let mut session = Session::new("mail.example.org").with_local_domains(test_domains());
 		session.command_line("EHLO client.example.org");
 		session
 	}
@@ -350,7 +378,57 @@ mod tests {
 	fn empty_recipient_is_rejected() {
 		let mut session = greeted();
 		session.command_line("MAIL FROM:<a@example.org>");
-		assert_eq!(reply_code(&session.command_line("RCPT TO:<>")), 501);
+		assert_eq!(reply_code(&session.command_line("RCPT TO:<>")), 553);
+	}
+
+	#[test]
+	fn malformed_recipient_is_rejected() {
+		let mut session = greeted();
+		session.command_line("MAIL FROM:<a@example.org>");
+		assert_eq!(
+			reply_code(&session.command_line("RCPT TO:<no-at-sign>")),
+			553
+		);
+	}
+
+	#[test]
+	fn non_local_recipient_is_denied() {
+		let mut session = greeted();
+		session.command_line("MAIL FROM:<a@example.org>");
+		let action = session.command_line("RCPT TO:<b@elsewhere.example>");
+		assert_eq!(reply_code(&action), 550);
+	}
+
+	#[test]
+	fn recipient_domain_match_is_case_insensitive() {
+		let mut session = greeted();
+		session.command_line("MAIL FROM:<a@example.org>");
+		assert_eq!(
+			reply_code(&session.command_line("RCPT TO:<b@EXAMPLE.ORG>")),
+			250
+		);
+	}
+
+	#[test]
+	fn without_local_domains_every_recipient_is_denied() {
+		let mut session = Session::new("mail.example.org");
+		session.command_line("EHLO client.example.org");
+		session.command_line("MAIL FROM:<a@example.org>");
+		assert_eq!(
+			reply_code(&session.command_line("RCPT TO:<b@example.org>")),
+			550
+		);
+	}
+
+	#[test]
+	fn malformed_reverse_path_is_rejected() {
+		let mut session = greeted();
+		assert_eq!(
+			reply_code(&session.command_line("MAIL FROM:<not-an-address>")),
+			553
+		);
+		// Null reverse-path stays legal for bounces.
+		assert_eq!(reply_code(&session.command_line("MAIL FROM:<>")), 250);
 	}
 
 	#[test]
