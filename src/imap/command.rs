@@ -15,6 +15,7 @@ pub enum Command {
 	Capability,
 	Noop,
 	Logout,
+	StartTls,
 	Login {
 		username: String,
 		password: String,
@@ -171,6 +172,7 @@ pub fn parse(line: &str) -> Result<Tagged, ParseError> {
 		"CAPABILITY" => no_args(&tag, args, Command::Capability)?,
 		"NOOP" => no_args(&tag, args, Command::Noop)?,
 		"LOGOUT" => no_args(&tag, args, Command::Logout)?,
+		"STARTTLS" => no_args(&tag, args, Command::StartTls)?,
 		"LOGIN" => parse_login(&tag, args)?,
 		"LIST" => parse_list(&tag, args)?,
 		"SELECT" => Command::Select {
@@ -628,8 +630,12 @@ mod tests {
 	#[test]
 	fn unknown_commands_keep_the_tag() {
 		assert_eq!(
-			parse("a1 STARTTLS"),
+			parse("a1 XFROBNICATE"),
 			Err(ParseError::Unknown("a1".to_string()))
+		);
+		assert_eq!(
+			parse("a2 STARTTLS").expect("parses").command,
+			Command::StartTls
 		);
 	}
 

@@ -136,9 +136,13 @@ impl Config {
 					"listener {addr} is \"submissions\" (implicit TLS) but no [tls] section is configured"
 				)));
 			}
-			if listener.kind == crate::config::ListenerKind::Imaps && self.tls.is_none() {
+			let needs_tls = matches!(
+				listener.kind,
+				crate::config::ListenerKind::Imaps | crate::config::ListenerKind::Imap
+			);
+			if needs_tls && self.tls.is_none() {
 				return Err(ConfigError::Invalid(format!(
-					"listener {addr} is \"imaps\" (implicit TLS) but no [tls] section is configured"
+					"listener {addr} requires a [tls] section (IMAP logins never cross plaintext)"
 				)));
 			}
 			if listener.kind == crate::config::ListenerKind::Api && self.api.is_none() {

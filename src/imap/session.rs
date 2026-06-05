@@ -20,6 +20,8 @@ pub struct Output {
 	pub collect_literal: Option<usize>,
 	/// After sending, read lines until `DONE` and call [`Session::idle_done`].
 	pub idle: bool,
+	/// After sending, perform the TLS handshake and call [`Session::tls_started`].
+	pub upgrade_tls: bool,
 }
 
 impl Output {
@@ -29,6 +31,7 @@ impl Output {
 			close: false,
 			collect_literal: None,
 			idle: false,
+			upgrade_tls: false,
 		}
 	}
 
@@ -38,6 +41,7 @@ impl Output {
 			close: true,
 			collect_literal: None,
 			idle: false,
+			upgrade_tls: false,
 		}
 	}
 }
@@ -66,9 +70,11 @@ pub struct Session {
 	pending_append: Option<(String, String, Vec<Flag>)>,
 	/// Tag of an in-flight IDLE.
 	idle_tag: Option<String>,
+	/// Whether the connection is inside TLS. LOGIN is refused outside.
+	tls_active: bool,
+	/// Whether STARTTLS can still be offered.
+	tls_available: bool,
 }
-
-const CAPABILITIES: &str = "IMAP4rev2 AUTH=PLAIN MOVE";
 
 impl Session {
 	/// New session over an established TLS connection.
@@ -80,13 +86,43 @@ impl Session {
 			state: State::NotAuthenticated { login_failures: 0 },
 			pending_append: None,
 			idle_tag: None,
+			tls_active: true,
+			tls_available: false,
 		}
+	}
+
+	/// Mark this session as starting in plaintext with STARTTLS available.
+	pub fn with_starttls(mut self) -> Self {
+		self.tls_active = false;
+		self.tls_available = true;
+		self
+	}
+
+	/// Called by the network layer after the TLS handshake completed.
+	pub fn tls_started(&mut self) {
+		self.tls_active = true;
+		self.tls_available = false;
+		self.state = State::NotAuthenticated { login_failures: 0 };
+	}
+
+	fn capabilities(&self) -> String {
+		let mut capabilities = String::from("IMAP4rev2 MOVE");
+		if self.tls_available {
+			capabilities.push_str(" STARTTLS");
+		}
+		if self.tls_active {
+			capabilities.push_str(" AUTH=PLAIN");
+		} else {
+			capabilities.push_str(" LOGINDISABLED");
+		}
+		capabilities
 	}
 
 	/// The greeting sent when the connection opens.
 	pub fn greeting(&self) -> Output {
 		Output::text(format!(
-			"* OK [CAPABILITY {CAPABILITIES}] {} IMAP4rev2 ready\r\n",
+			"* OK [CAPABILITY {}] {} IMAP4rev2 ready\r\n",
+			self.capabilities(),
 			self.hostname
 		))
 	}
@@ -112,8 +148,17 @@ impl Session {
 		let tag = tagged.tag;
 		match tagged.command {
 			Command::Capability => Output::text(format!(
-				"* CAPABILITY {CAPABILITIES}\r\n{tag} OK CAPABILITY completed\r\n"
+				"* CAPABILITY {}\r\n{tag} OK CAPABILITY completed\r\n",
+				self.capabilities()
 			)),
+			Command::StartTls => {
+				if !self.tls_available {
+					return Output::text(format!("{tag} BAD TLS already active\r\n"));
+				}
+				let mut output = Output::text(format!("{tag} OK begin TLS now\r\n"));
+				output.upgrade_tls = true;
+				output
+			}
 			Command::Noop => Output::text(format!("{tag} OK NOOP completed\r\n")),
 			Command::Logout => Output::closing(format!(
 				"* BYE logging out\r\n{tag} OK LOGOUT completed\r\n"
@@ -170,6 +215,10 @@ impl Session {
 	}
 
 	fn login(&mut self, tag: &str, username: &str, password: &str) -> Output {
+		if !self.tls_active {
+			// Credentials never cross plaintext.
+			return Output::text(format!("{tag} NO [PRIVACYREQUIRED] STARTTLS first\r\n"));
+		}
 		let State::NotAuthenticated { login_failures } = &mut self.state else {
 			return Output::text(format!("{tag} BAD already authenticated\r\n"));
 		};
@@ -610,6 +659,7 @@ impl Session {
 			close: false,
 			collect_literal: None,
 			idle: false,
+			upgrade_tls: false,
 		}
 	}
 }
@@ -1121,6 +1171,46 @@ mod tests {
 		session.command_line("a3 SELECT INBOX");
 		let response = text(&session.command_line("a4 SEARCH BOGUSKEY"));
 		assert!(response.contains("a4 BAD"), "{response}");
+	}
+
+	#[test]
+	fn plaintext_session_disables_login_until_starttls() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let mut session =
+			Session::new("mail.example.org", dir.path().to_path_buf(), directory()).with_starttls();
+
+		let greeting = text(&session.greeting());
+		assert!(greeting.contains("STARTTLS"), "{greeting}");
+		assert!(greeting.contains("LOGINDISABLED"), "{greeting}");
+		assert!(!greeting.contains("AUTH=PLAIN"), "{greeting}");
+
+		let output = session.command_line("a1 LOGIN alice secret");
+		assert!(
+			text(&output).contains("PRIVACYREQUIRED"),
+			"{}",
+			text(&output)
+		);
+
+		let output = session.command_line("a2 STARTTLS");
+		assert!(output.upgrade_tls);
+		assert!(text(&output).contains("a2 OK"), "{}", text(&output));
+
+		session.tls_started();
+		let output = session.command_line("a3 CAPABILITY");
+		let response = text(&output);
+		assert!(!response.contains("STARTTLS"), "{response}");
+		assert!(response.contains("AUTH=PLAIN"), "{response}");
+		let output = session.command_line("a4 LOGIN alice secret");
+		assert!(text(&output).contains("a4 OK"), "{}", text(&output));
+	}
+
+	#[test]
+	fn starttls_inside_tls_is_bad() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let mut session = logged_in(dir.path());
+		let output = session.command_line("a2 STARTTLS");
+		assert!(text(&output).contains("a2 BAD"), "{}", text(&output));
+		assert!(!output.upgrade_tls);
 	}
 
 	#[test]

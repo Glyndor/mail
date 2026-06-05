@@ -20,6 +20,8 @@ pub enum ListenerKind {
 	Api,
 	/// IMAP over implicit TLS (port 993).
 	Imaps,
+	/// IMAP with mandatory STARTTLS upgrade (port 143).
+	Imap,
 }
 
 impl ListenerKind {
@@ -31,6 +33,7 @@ impl ListenerKind {
 			ListenerKind::Submissions => 465,
 			ListenerKind::Api => 8025,
 			ListenerKind::Imaps => 993,
+			ListenerKind::Imap => 143,
 		}
 	}
 }
