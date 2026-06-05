@@ -16,6 +16,8 @@ pub enum ListenerKind {
 	Submission,
 	/// Authenticated client submission over implicit TLS (port 465).
 	Submissions,
+	/// Management HTTP API.
+	Api,
 }
 
 impl ListenerKind {
@@ -25,6 +27,7 @@ impl ListenerKind {
 			ListenerKind::Smtp => 25,
 			ListenerKind::Submission => 587,
 			ListenerKind::Submissions => 465,
+			ListenerKind::Api => 8025,
 		}
 	}
 }

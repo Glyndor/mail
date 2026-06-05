@@ -12,7 +12,21 @@ impl Config {
 		self.validate_data_dir()?;
 		self.validate_domains()?;
 		self.validate_accounts()?;
+		self.validate_api()?;
 		self.validate_listeners()?;
+		Ok(())
+	}
+
+	fn validate_api(&self) -> Result<(), ConfigError> {
+		if let Some(api) = &self.api {
+			let argon2id = api.token_hash.starts_with("$argon2id$")
+				&& argon2::password_hash::PasswordHash::new(&api.token_hash).is_ok();
+			if !argon2id {
+				return Err(ConfigError::Invalid(
+					"[api] token_hash must be an argon2id PHC string".into(),
+				));
+			}
+		}
 		Ok(())
 	}
 
@@ -120,6 +134,11 @@ impl Config {
 			if listener.kind == crate::config::ListenerKind::Submissions && self.tls.is_none() {
 				return Err(ConfigError::Invalid(format!(
 					"listener {addr} is \"submissions\" (implicit TLS) but no [tls] section is configured"
+				)));
+			}
+			if listener.kind == crate::config::ListenerKind::Api && self.api.is_none() {
+				return Err(ConfigError::Invalid(format!(
+					"listener {addr} is \"api\" but no [api] section is configured"
 				)));
 			}
 		}

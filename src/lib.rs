@@ -4,6 +4,7 @@
 //! through an API and a CLI. This crate hosts all server logic; the binary
 //! in `main.rs` is a thin entry point.
 
+pub mod api;
 pub mod cli;
 pub mod clock;
 pub mod config;

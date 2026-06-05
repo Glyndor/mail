@@ -5,12 +5,14 @@
 //! it, and any validation error aborts loading (fail closed).
 
 mod account;
+mod api;
 mod dkim;
 mod listener;
 mod tls;
 mod validate;
 
 pub use account::Account;
+pub use api::Api;
 pub use dkim::Dkim;
 pub use listener::{Listener, ListenerKind};
 pub use tls::Tls;
@@ -61,6 +63,8 @@ pub struct Config {
 	pub tls: Option<Tls>,
 	/// DKIM signing for outbound mail.
 	pub dkim: Option<Dkim>,
+	/// Management API. Required by `api` listeners.
+	pub api: Option<Api>,
 }
 
 impl Config {

@@ -85,6 +85,28 @@ async fn serve(config: Config) -> std::io::Result<()> {
 	let mut tasks = Vec::new();
 	for listener_config in &config.listeners {
 		match listener_config.kind {
+			ListenerKind::Api => {
+				// Validation guarantees [api] exists for api listeners.
+				let api = config
+					.api
+					.as_ref()
+					.ok_or_else(|| std::io::Error::other("api listener without [api] section"))?;
+				let state = crate::api::ApiState::new(
+					&api.token_hash,
+					config.domains.clone(),
+					&config.accounts,
+					crate::storage::FsSpool::open(&config.data_dir)?,
+				);
+				let addr = listener_config.socket_addr();
+				let listener = TcpListener::bind(addr).await?;
+				tracing::info!(%addr, kind = ?listener_config.kind, "listening");
+				let router = crate::api::router(state);
+				tasks.push(tokio::spawn(async move {
+					axum::serve(listener, router)
+						.await
+						.map_err(std::io::Error::other)
+				}));
+			}
 			ListenerKind::Smtp | ListenerKind::Submission | ListenerKind::Submissions => {
 				let addr = listener_config.socket_addr();
 				let listener = TcpListener::bind(addr).await?;
