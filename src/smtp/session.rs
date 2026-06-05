@@ -270,10 +270,26 @@ impl Session {
 	fn mail_from(&mut self, reverse_path: String, size: Option<u64>) -> Action {
 		match self.state {
 			State::Greeted => {
-				// The null reverse-path (bounces) is legal; anything else
-				// must be a syntactically valid address.
-				if !reverse_path.is_empty() && Address::parse(&reverse_path).is_err() {
-					return Action::Continue(Reply::single(553, "invalid reverse-path"));
+				match (&self.authenticated, Address::parse(&reverse_path)) {
+					// Authenticated senders must use one of their own
+					// addresses — no spoofing, no null path.
+					(Some(account), Ok(address))
+						if !self.directory.owns_address(account, &address) =>
+					{
+						return Action::Continue(Reply::single(
+							553,
+							"5.7.1 sender address not owned by authenticated user",
+						));
+					}
+					(Some(_), Err(_)) => {
+						return Action::Continue(Reply::single(553, "invalid reverse-path"));
+					}
+					// The null reverse-path (bounces) is legal when
+					// unauthenticated; anything else must parse.
+					(None, Err(_)) if !reverse_path.is_empty() => {
+						return Action::Continue(Reply::single(553, "invalid reverse-path"));
+					}
+					_ => {}
 				}
 				// SIZE is declared up front: reject oversize without DATA.
 				if size.is_some_and(|s| s > MAX_MESSAGE_SIZE as u64) {
@@ -291,9 +307,11 @@ impl Session {
 			return Action::Continue(Reply::single(553, "invalid recipient address"));
 		};
 		match self.directory.resolve(&address) {
-			// Not one of our domains: this server does not relay.
+			// Foreign domains are relayed only for authenticated users.
 			Resolution::NotLocal => {
-				return Action::Continue(Reply::single(550, "5.7.1 relaying denied"));
+				if self.authenticated.is_none() {
+					return Action::Continue(Reply::single(550, "5.7.1 relaying denied"));
+				}
 			}
 			Resolution::UnknownUser => {
 				return Action::Continue(Reply::single(550, "5.1.1 no such user"));
@@ -744,6 +762,51 @@ mod tests {
 		session.command_line("MAIL FROM:<alice@example.org>");
 		let action = session.command_line(&format!("AUTH PLAIN {}", plain("alice", "secret")));
 		assert_eq!(reply_code(&action), 503);
+	}
+
+	fn authenticated_session() -> Session {
+		let mut session = tls_session();
+		session.command_line(&format!("AUTH PLAIN {}", plain("alice", "secret")));
+		assert_eq!(session.authenticated(), Some("alice"));
+		session
+	}
+
+	#[test]
+	fn authenticated_user_may_relay_to_foreign_domains() {
+		let mut session = authenticated_session();
+		session.command_line("MAIL FROM:<alice@example.org>");
+		let action = session.command_line("RCPT TO:<bob@elsewhere.example>");
+		assert_eq!(reply_code(&action), 250);
+	}
+
+	#[test]
+	fn unauthenticated_relay_stays_denied() {
+		let mut session = tls_session();
+		session.command_line("MAIL FROM:<someone@elsewhere.example>");
+		let action = session.command_line("RCPT TO:<bob@elsewhere.example>");
+		assert_eq!(reply_code(&action), 550);
+	}
+
+	#[test]
+	fn authenticated_sender_must_own_the_address() {
+		let mut session = authenticated_session();
+		let action = session.command_line("MAIL FROM:<other@elsewhere.example>");
+		assert_eq!(reply_code(&action), 553);
+	}
+
+	#[test]
+	fn authenticated_sender_cannot_use_null_path() {
+		let mut session = authenticated_session();
+		let action = session.command_line("MAIL FROM:<>");
+		assert_eq!(reply_code(&action), 553);
+	}
+
+	#[test]
+	fn authenticated_relay_still_rejects_unknown_local_users() {
+		let mut session = authenticated_session();
+		session.command_line("MAIL FROM:<alice@example.org>");
+		let action = session.command_line("RCPT TO:<stranger@example.org>");
+		assert_eq!(reply_code(&action), 550);
 	}
 
 	#[test]

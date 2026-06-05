@@ -75,6 +75,13 @@ impl Directory {
 		Some((account, hash.as_str()))
 	}
 
+	/// Whether `address` belongs to `account`.
+	pub fn owns_address(&self, account: &str, address: &Address) -> bool {
+		self.accounts_by_address
+			.get(&address.to_string().to_ascii_lowercase())
+			.is_some_and(|owner| owner == account)
+	}
+
 	/// Resolve a validated address.
 	pub fn resolve(&self, address: &Address) -> Resolution {
 		if !self.domains.contains(address.domain()) {

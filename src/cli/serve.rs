@@ -9,7 +9,7 @@ use crate::config::{Config, ListenerKind};
 use crate::smtp::directory::Directory;
 use crate::smtp::server::{Server, TlsMode};
 use crate::smtp::sink::MessageSink;
-use crate::storage::LocalDelivery;
+use crate::storage::SplitDelivery;
 
 /// Run the server with a validated configuration.
 pub fn run(config: Config) -> ExitCode {
@@ -54,8 +54,9 @@ async fn serve(config: Config) -> std::io::Result<()> {
 		})),
 	);
 
-	// Accepted inbound mail is delivered to account mailboxes.
-	let sink: Arc<dyn MessageSink> = Arc::new(LocalDelivery::new(
+	// Local recipients go to account mailboxes; authenticated relay mail
+	// is queued in the outbound spool.
+	let sink: Arc<dyn MessageSink> = Arc::new(SplitDelivery::new(
 		&config.data_dir,
 		Arc::clone(&directory),
 	)?);
