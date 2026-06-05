@@ -65,6 +65,10 @@ pub struct Session {
 	state: State,
 	/// Whether STARTTLS can be offered (TLS configured, not yet active).
 	tls_available: bool,
+	/// Whether the connection is already inside TLS.
+	tls_active: bool,
+	/// The domain the client announced in HELO/EHLO, for trace headers.
+	helo_domain: Option<String>,
 	/// Recipient resolution. An empty directory rejects every recipient
 	/// (fail closed).
 	directory: Arc<Directory>,
@@ -77,8 +81,27 @@ impl Session {
 			hostname: hostname.to_string(),
 			state: State::Connected,
 			tls_available: false,
+			tls_active: false,
+			helo_domain: None,
 			directory: Arc::new(Directory::default()),
 		}
+	}
+
+	/// Mark this session as running inside TLS from the start
+	/// (implicit-TLS listeners).
+	pub fn with_tls_active(mut self) -> Self {
+		self.tls_active = true;
+		self
+	}
+
+	/// The domain announced by the client in HELO/EHLO.
+	pub fn helo_domain(&self) -> Option<&str> {
+		self.helo_domain.as_deref()
+	}
+
+	/// Whether the connection is inside TLS.
+	pub fn tls_active(&self) -> bool {
+		self.tls_active
 	}
 
 	/// Set the directory used to resolve recipients.
@@ -99,6 +122,8 @@ impl Session {
 	pub fn tls_started(&mut self) {
 		self.state = State::Connected;
 		self.tls_available = false;
+		self.tls_active = true;
+		self.helo_domain = None;
 	}
 
 	/// The greeting sent when the connection opens.
@@ -141,8 +166,9 @@ impl Session {
 		}
 	}
 
-	fn greet(&mut self, _domain: String) -> Action {
+	fn greet(&mut self, domain: String) -> Action {
 		self.state = State::Greeted;
+		self.helo_domain = Some(domain);
 		let mut lines = vec![
 			self.hostname.clone(),
 			"PIPELINING".to_string(),

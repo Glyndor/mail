@@ -11,7 +11,7 @@ flowchart LR
 	client([SMTP client]) -->|25 / 587 / 465| tls[TLS / STARTTLS]
 	tls --> smtp[SMTP listener]
 	smtp --> session[Session state machine]
-	session -->|local domains only| spool[(Crash-safe spool)]
+	session -->|local recipients only| mailbox[(Account mailboxes)]
 	cli[CLI] --> config[Config / fail-closed validation]
 	config --> smtp
 ```
@@ -24,7 +24,7 @@ flowchart LR
 - 🚫 **No relay, no ghosts** — recipients outside the configured `domains` answer `550 5.7.1`, unknown users in local domains answer `550 5.1.1`; with nothing configured everything is denied (fail closed)
 - 📬 **Local delivery** — accepted mail lands once per recipient account under `data_dir/accounts/<name>/new/`
 - 🔒 **Secure by default** — listeners bind to localhost unless explicitly configured otherwise; configuration fails closed on any unknown key or invalid value
-- 💾 **Crash-safe spool** — accepted messages are fsynced and atomically renamed before the server answers `250`
+- 💾 **Crash-safe writes** — accepted messages are fsynced and atomically renamed into the mailbox before the server answers `250`
 - 🧰 **Operator CLI** — `mail serve`, `mail config-check`, meaningful exit codes
 
 ## 🚀 Quick start

@@ -5,6 +5,7 @@
 //! in `main.rs` is a thin entry point.
 
 pub mod cli;
+pub mod clock;
 pub mod config;
 pub mod smtp;
 pub mod storage;

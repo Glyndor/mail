@@ -1,5 +1,6 @@
 //! SMTP network layer: accepts connections and drives sessions.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -81,31 +82,35 @@ impl Server {
 			let server = Arc::clone(&self);
 			tokio::spawn(async move {
 				tracing::debug!(%peer, "connection accepted");
-				if let Err(error) = server.handle(stream).await {
+				if let Err(error) = server.handle(stream, Some(peer.ip())).await {
 					tracing::debug!(%peer, %error, "connection ended with error");
 				}
 			});
 		}
 	}
 
-	/// Drive one connection from greeting to close.
-	pub async fn handle<S>(&self, stream: S) -> std::io::Result<()>
+	/// Drive one connection from greeting to close. `peer` is the client
+	/// address recorded in trace headers; `None` for in-memory tests.
+	pub async fn handle<S>(&self, stream: S, peer: Option<IpAddr>) -> std::io::Result<()>
 	where
 		S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 	{
 		match (self.tls_mode, &self.tls) {
 			(TlsMode::Implicit, Some(acceptor)) => {
 				let tls_stream = acceptor.accept(stream).await?;
-				self.run(Box::new(tls_stream), self.new_session()).await
+				let session = self.new_session().with_tls_active();
+				self.run(Box::new(tls_stream), session, peer).await
 			}
 			(TlsMode::Implicit, None) => Err(std::io::Error::other(
 				"implicit TLS listener without TLS acceptor",
 			)),
 			(TlsMode::Opportunistic, Some(_)) => {
 				let session = self.new_session().with_tls_available();
-				self.run(Box::new(stream), session).await
+				self.run(Box::new(stream), session, peer).await
 			}
-			(TlsMode::Opportunistic, None) => self.run(Box::new(stream), self.new_session()).await,
+			(TlsMode::Opportunistic, None) => {
+				self.run(Box::new(stream), self.new_session(), peer).await
+			}
 		}
 	}
 
@@ -114,6 +119,7 @@ impl Server {
 		&self,
 		mut stream: Box<dyn Connection>,
 		mut session: Session,
+		peer: Option<IpAddr>,
 	) -> std::io::Result<()> {
 		send(&mut stream, &session.greeting()).await?;
 
@@ -167,7 +173,17 @@ impl Server {
 					mode = Mode::Data;
 					send(&mut stream, &reply).await?;
 				}
-				Action::Deliver(reply, message) => {
+				Action::Deliver(reply, mut message) => {
+					let header = received_header(
+						session.helo_domain(),
+						peer,
+						&self.hostname,
+						session.tls_active(),
+						std::time::SystemTime::now(),
+					);
+					let mut stamped = header.into_bytes();
+					stamped.append(&mut message.data);
+					message.data = stamped;
 					let reply = match self.sink.deliver(message) {
 						Ok(()) => reply,
 						Err(error) => {
@@ -201,6 +217,26 @@ impl Server {
 			}
 		}
 	}
+}
+
+/// Build the RFC 5321 section 4.4 trace header prepended to accepted mail.
+fn received_header(
+	helo: Option<&str>,
+	peer: Option<IpAddr>,
+	hostname: &str,
+	tls: bool,
+	now: std::time::SystemTime,
+) -> String {
+	let client = helo.unwrap_or("unknown");
+	let peer = match peer {
+		Some(ip) => format!("[{ip}]"),
+		None => "[unknown]".to_string(),
+	};
+	let protocol = if tls { "ESMTPS" } else { "ESMTP" };
+	format!(
+		"Received: from {client} ({peer})\r\n\tby {hostname} with {protocol};\r\n\t{}\r\n",
+		crate::clock::rfc5322(now)
+	)
 }
 
 fn line_error_reply(error: &LineError) -> Reply {
@@ -244,7 +280,7 @@ mod tests {
 			.with_directory(test_directory());
 
 		let (client, server_stream) = tokio::io::duplex(64 * 1024);
-		let task = tokio::spawn(async move { server.handle(server_stream).await });
+		let task = tokio::spawn(async move { server.handle(server_stream, None).await });
 
 		let (mut client_read, mut client_write) = tokio::io::split(client);
 		client_write.write_all(input).await.expect("client write");
@@ -287,7 +323,13 @@ QUIT\r\n";
 		let messages = sink.messages();
 		assert_eq!(messages.len(), 1);
 		assert_eq!(messages[0].reverse_path, "alice@example.org");
-		assert_eq!(messages[0].data, b"Subject: hi\r\n\r\nhello\r\n");
+		let data = String::from_utf8(messages[0].data.clone()).expect("ascii message");
+		assert!(
+			data.starts_with("Received: from client.example.org ([unknown])\r\n"),
+			"{data}"
+		);
+		assert!(data.contains("with ESMTP;"), "{data}");
+		assert!(data.ends_with("Subject: hi\r\n\r\nhello\r\n"), "{data}");
 	}
 
 	#[tokio::test]
@@ -377,7 +419,7 @@ DATA\r\n\
 			.with_tls(acceptor, TlsMode::Opportunistic);
 
 		let (mut client, server_stream) = tokio::io::duplex(64 * 1024);
-		let task = tokio::spawn(async move { server.handle(server_stream).await });
+		let task = tokio::spawn(async move { server.handle(server_stream, None).await });
 
 		assert!(read_reply(&mut client).await.starts_with("220 "));
 		client
@@ -430,7 +472,11 @@ DATA\r\n\
 		task.abort();
 		let messages = sink.messages();
 		assert_eq!(messages.len(), 1);
-		assert_eq!(messages[0].data, b"secret\r\n");
+		let data = String::from_utf8(messages[0].data.clone()).expect("ascii message");
+		// The trace header records the TLS protocol.
+		assert!(data.starts_with("Received: from c.example.org"), "{data}");
+		assert!(data.contains("with ESMTPS;"), "{data}");
+		assert!(data.ends_with("secret\r\n"), "{data}");
 	}
 
 	#[tokio::test]
@@ -441,7 +487,7 @@ DATA\r\n\
 			.with_tls(acceptor, TlsMode::Implicit);
 
 		let (client, server_stream) = tokio::io::duplex(64 * 1024);
-		let task = tokio::spawn(async move { server.handle(server_stream).await });
+		let task = tokio::spawn(async move { server.handle(server_stream, None).await });
 
 		let connector = test_connector(cert);
 		let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from("mail.example.org")
@@ -468,7 +514,7 @@ DATA\r\n\
 			directory: Arc::new(Directory::default()),
 		};
 		let (_client, server_stream) = tokio::io::duplex(1024);
-		assert!(server.handle(server_stream).await.is_err());
+		assert!(server.handle(server_stream, None).await.is_err());
 	}
 
 	#[tokio::test]
