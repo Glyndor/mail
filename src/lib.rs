@@ -7,6 +7,7 @@
 pub mod cli;
 pub mod clock;
 pub mod config;
+pub mod dkim;
 pub mod queue;
 pub mod smtp;
 pub mod spf;

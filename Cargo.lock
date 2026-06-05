@@ -954,6 +954,7 @@ dependencies = [
  "clap",
  "hickory-resolver",
  "rcgen",
+ "ring",
  "rustls-pemfile",
  "serde",
  "serde_json",

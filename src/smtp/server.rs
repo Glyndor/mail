@@ -190,8 +190,9 @@ impl Server {
 					send(&mut stream, &reply).await?;
 				}
 				Action::Deliver(reply, mut message) => {
-					// SPF applies to unauthenticated mail from a known peer.
-					let mut spf_header = None;
+					// SPF and DKIM apply to unauthenticated mail from a
+					// known peer.
+					let mut auth_headers = String::new();
 					if let (Some(dns), Some(ip), None) = (&self.spf, peer, session.authenticated())
 					{
 						let domain = spf_domain(&message.reverse_path, session.helo_domain());
@@ -217,11 +218,32 @@ impl Server {
 								continue;
 							}
 							outcome => {
-								spf_header = Some(format!(
+								auth_headers.push_str(&format!(
 									"Received-SPF: {} (domain of {}) client-ip={ip}\r\n",
 									outcome.as_str(),
 									domain.as_deref().unwrap_or("unknown"),
 								));
+
+								// DKIM is recorded, never rejected on: that
+								// policy decision belongs to DMARC.
+								let dkim_results =
+									crate::dkim::verify_message(dns.as_ref(), &message.data).await;
+								let mut results = format!(
+									"Authentication-Results: {}; spf={}",
+									self.hostname,
+									outcome.as_str()
+								);
+								if let Some(domain) = &domain {
+									results.push_str(&format!(" smtp.mailfrom={domain}"));
+								}
+								for dkim in &dkim_results {
+									results.push_str(&format!("; dkim={}", dkim.outcome.as_str()));
+									if let Some(d) = &dkim.domain {
+										results.push_str(&format!(" header.d={d}"));
+									}
+								}
+								results.push_str("\r\n");
+								auth_headers.push_str(&results);
 							}
 						}
 					}
@@ -233,9 +255,7 @@ impl Server {
 						std::time::SystemTime::now(),
 					);
 					let mut stamped = header.into_bytes();
-					if let Some(spf_header) = spf_header {
-						stamped.extend_from_slice(spf_header.as_bytes());
-					}
+					stamped.extend_from_slice(auth_headers.as_bytes());
 					stamped.append(&mut message.data);
 					message.data = stamped;
 					let reply = match self.sink.deliver(message) {
@@ -531,6 +551,18 @@ QUIT\r\n";
 		let data = String::from_utf8(messages[0].data.clone()).expect("ascii");
 		assert!(
 			data.contains("Received-SPF: pass (domain of sender.example) client-ip=192.0.2.7"),
+			"{data}"
+		);
+	}
+
+	#[tokio::test]
+	async fn unsigned_message_records_dkim_none() {
+		let (_, sink) = converse_with_spf("v=spf1 ip4:192.0.2.0/24 -all").await;
+		let data = String::from_utf8(sink.messages()[0].data.clone()).expect("ascii");
+		assert!(
+			data.contains(
+				"Authentication-Results: mail.example.org; spf=pass smtp.mailfrom=sender.example; dkim=none"
+			),
 			"{data}"
 		);
 	}
