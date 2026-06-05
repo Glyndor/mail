@@ -110,11 +110,15 @@ async fn serve(config: Config) -> std::io::Result<()> {
 						.map_err(std::io::Error::other)
 				}));
 			}
-			ListenerKind::Imaps => {
+			ListenerKind::Imaps | ListenerKind::Imap => {
 				let Some(acceptor) = &tls_acceptor else {
 					return Err(std::io::Error::other(
-						"imaps listener without TLS configured",
+						"IMAP listener without TLS configured",
 					));
+				};
+				let mode = match listener_config.kind {
+					ListenerKind::Imap => crate::imap::server::TlsMode::StartTls,
+					_ => crate::imap::server::TlsMode::Implicit,
 				};
 				let addr = listener_config.socket_addr();
 				let listener = TcpListener::bind(addr).await?;
@@ -124,6 +128,7 @@ async fn serve(config: Config) -> std::io::Result<()> {
 					config.data_dir.clone(),
 					Arc::clone(&directory),
 					acceptor.clone(),
+					mode,
 				));
 				tasks.push(tokio::spawn(server.serve(listener)));
 			}
