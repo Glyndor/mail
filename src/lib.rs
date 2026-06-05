@@ -5,3 +5,4 @@
 //! in `main.rs` is a thin entry point.
 
 pub mod config;
+pub mod smtp;
