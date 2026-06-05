@@ -98,11 +98,58 @@ impl Server {
 				continue;
 			};
 
-			let output = session.command_line(&line);
-			stream.write_all(&output.bytes).await?;
-			stream.flush().await?;
-			if output.close {
-				return Ok(());
+			let mut output = session.command_line(&line);
+			loop {
+				stream.write_all(&output.bytes).await?;
+				stream.flush().await?;
+				if output.close {
+					return Ok(());
+				}
+				if let Some(size) = output.collect_literal {
+					// Read exactly `size` literal bytes (plus trailing CRLF
+					// which the line decoder will consume as an empty line).
+					let mut literal = decoder.take_buffered(size);
+					let mut chunk = [0u8; 4096];
+					while literal.len() < size {
+						let read = stream.read(&mut chunk).await?;
+						if read == 0 {
+							return Ok(());
+						}
+						let needed = size - literal.len();
+						if read <= needed {
+							literal.extend_from_slice(&chunk[..read]);
+						} else {
+							literal.extend_from_slice(&chunk[..needed]);
+							decoder.feed(&chunk[needed..read]);
+						}
+					}
+					output = session.literal_done(&literal);
+					continue;
+				}
+				if output.idle {
+					// Read lines until DONE.
+					loop {
+						match decoder.next_line() {
+							Ok(Some(line)) => {
+								if line.eq_ignore_ascii_case(b"DONE") {
+									break;
+								}
+								// Anything else during IDLE is ignored.
+							}
+							Ok(None) => {
+								let read = stream.read(&mut buffer).await?;
+								if read == 0 {
+									return Ok(());
+								}
+								decoder.feed(&buffer[..read]);
+							}
+							Err(_) => return Ok(()),
+						}
+					}
+					output = session.idle_done();
+					continue;
+				}
+				break;
 			}
 		}
 	}
