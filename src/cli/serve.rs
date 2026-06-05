@@ -61,6 +61,9 @@ async fn serve(config: Config) -> std::io::Result<()> {
 		Arc::clone(&directory),
 	)?);
 
+	// SPF verification for unauthenticated inbound mail.
+	let spf_dns: Arc<dyn crate::spf::DnsLookup> = Arc::new(crate::spf::SystemDns::from_system()?);
+
 	// The queue worker drains the outbound spool in the background.
 	let connector = Arc::new(crate::queue::MxConnector::from_system()?);
 	let worker = Arc::new(crate::queue::Worker::new(
@@ -88,7 +91,8 @@ async fn serve(config: Config) -> std::io::Result<()> {
 					_ => TlsMode::Opportunistic,
 				};
 				let mut server = Server::new(&config.hostname, Arc::clone(&sink))
-					.with_directory(Arc::clone(&directory));
+					.with_directory(Arc::clone(&directory))
+					.with_spf(Arc::clone(&spf_dns));
 				if let Some(acceptor) = &tls_acceptor {
 					server = server.with_tls(acceptor.clone(), mode);
 				}
