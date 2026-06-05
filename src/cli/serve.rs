@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::config::{Config, ListenerKind};
-use crate::smtp::server::Server;
+use crate::smtp::server::{Server, TlsMode};
 use crate::smtp::sink::MessageSink;
 use crate::storage::FsSpool;
 
@@ -36,16 +36,29 @@ async fn serve(config: Config) -> std::io::Result<()> {
 
 	// Accepted messages land in the filesystem spool under data_dir.
 	let sink: Arc<dyn MessageSink> = Arc::new(FsSpool::open(&config.data_dir)?);
-	let mut tasks = Vec::new();
 
+	// TLS is loaded once and shared; failure to load is fatal (fail closed).
+	let tls_acceptor = match &config.tls {
+		Some(tls_config) => Some(crate::tls::acceptor(tls_config).map_err(std::io::Error::other)?),
+		None => None,
+	};
+
+	let mut tasks = Vec::new();
 	for listener_config in &config.listeners {
 		match listener_config.kind {
 			ListenerKind::Smtp | ListenerKind::Submission | ListenerKind::Submissions => {
 				let addr = listener_config.socket_addr();
 				let listener = TcpListener::bind(addr).await?;
 				tracing::info!(%addr, kind = ?listener_config.kind, "listening");
-				let server = Arc::new(Server::new(&config.hostname, Arc::clone(&sink)));
-				tasks.push(tokio::spawn(server.serve(listener)));
+				let mode = match listener_config.kind {
+					ListenerKind::Submissions => TlsMode::Implicit,
+					_ => TlsMode::Opportunistic,
+				};
+				let mut server = Server::new(&config.hostname, Arc::clone(&sink));
+				if let Some(acceptor) = &tls_acceptor {
+					server = server.with_tls(acceptor.clone(), mode);
+				}
+				tasks.push(tokio::spawn(Arc::new(server).serve(listener)));
 			}
 		}
 	}

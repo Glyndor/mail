@@ -5,9 +5,11 @@
 //! it, and any validation error aborts loading (fail closed).
 
 mod listener;
+mod tls;
 mod validate;
 
 pub use listener::{Listener, ListenerKind};
+pub use tls::Tls;
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
@@ -42,6 +44,9 @@ pub struct Config {
 	/// Network listeners. Empty means the server starts nothing.
 	#[serde(default)]
 	pub listeners: Vec<Listener>,
+	/// TLS material. Required by `submissions` listeners; enables STARTTLS
+	/// on `smtp` and `submission` listeners.
+	pub tls: Option<Tls>,
 }
 
 impl Config {
