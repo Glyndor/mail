@@ -30,6 +30,16 @@ pub enum Command {
 		mailbox: String,
 	},
 	Close,
+	Create {
+		mailbox: String,
+	},
+	Delete {
+		mailbox: String,
+	},
+	Rename {
+		from: String,
+		to: String,
+	},
 	Expunge,
 	Idle,
 	/// `APPEND <mailbox> [(flags)] {size}` — the literal body follows.
@@ -143,6 +153,21 @@ pub fn parse(line: &str) -> Result<Tagged, ParseError> {
 			mailbox: parse_mailbox(&tag, args)?,
 		},
 		"CLOSE" => no_args(&tag, args, Command::Close)?,
+		"CREATE" => Command::Create {
+			mailbox: parse_mailbox(&tag, args)?,
+		},
+		"DELETE" => Command::Delete {
+			mailbox: parse_mailbox(&tag, args)?,
+		},
+		"RENAME" => {
+			let bad = || ParseError::BadArguments(tag.clone());
+			let (from, rest) = parse_astring(args).ok_or_else(bad)?;
+			let (to, rest) = parse_astring(rest).ok_or_else(bad)?;
+			if !rest.trim().is_empty() || from.is_empty() || to.is_empty() {
+				return Err(bad());
+			}
+			Command::Rename { from, to }
+		}
 		"EXPUNGE" => no_args(&tag, args, Command::Expunge)?,
 		"IDLE" => no_args(&tag, args, Command::Idle)?,
 		"APPEND" => parse_append(&tag, args)?,
