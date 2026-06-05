@@ -4,10 +4,12 @@
 //! listeners bind to localhost, TLS is required wherever a transport supports
 //! it, and any validation error aborts loading (fail closed).
 
+mod account;
 mod listener;
 mod tls;
 mod validate;
 
+pub use account::Account;
 pub use listener::{Listener, ListenerKind};
 pub use tls::Tls;
 
@@ -48,6 +50,10 @@ pub struct Config {
 	/// Network listeners. Empty means the server starts nothing.
 	#[serde(default)]
 	pub listeners: Vec<Listener>,
+	/// Mail accounts. Mail for a local domain address not listed here is
+	/// rejected during RCPT.
+	#[serde(default)]
+	pub accounts: Vec<Account>,
 	/// TLS material. Required by `submissions` listeners; enables STARTTLS
 	/// on `smtp` and `submission` listeners.
 	pub tls: Option<Tls>,

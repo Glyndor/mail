@@ -117,7 +117,7 @@ impl MessageSink for FsSpool {
 }
 
 /// Write `bytes` to `path` and fsync the file before returning.
-fn write_sync(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(super) fn write_sync(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 	let mut file = fs::File::create(path)?;
 	file.write_all(bytes)?;
 	file.sync_all()

@@ -4,11 +4,11 @@
 //! produces replies plus completed messages. The network layer owns sockets
 //! and feeds this machine, which keeps the protocol logic fully unit-testable.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::address::Address;
 use super::command::{Command, ParseError};
+use super::directory::{Directory, Resolution};
 use super::reply::Reply;
 
 /// Maximum accepted message size in bytes until quotas exist.
@@ -65,9 +65,9 @@ pub struct Session {
 	state: State,
 	/// Whether STARTTLS can be offered (TLS configured, not yet active).
 	tls_available: bool,
-	/// Lowercased domains this server accepts mail for. Empty set means
-	/// every recipient is rejected (fail closed).
-	local_domains: Arc<HashSet<String>>,
+	/// Recipient resolution. An empty directory rejects every recipient
+	/// (fail closed).
+	directory: Arc<Directory>,
 }
 
 impl Session {
@@ -77,13 +77,13 @@ impl Session {
 			hostname: hostname.to_string(),
 			state: State::Connected,
 			tls_available: false,
-			local_domains: Arc::new(HashSet::new()),
+			directory: Arc::new(Directory::default()),
 		}
 	}
 
-	/// Set the domains this session accepts recipients for.
-	pub fn with_local_domains(mut self, domains: Arc<HashSet<String>>) -> Self {
-		self.local_domains = domains;
+	/// Set the directory used to resolve recipients.
+	pub fn with_directory(mut self, directory: Arc<Directory>) -> Self {
+		self.directory = directory;
 		self
 	}
 
@@ -189,9 +189,15 @@ impl Session {
 		let Ok(address) = Address::parse(&forward_path) else {
 			return Action::Continue(Reply::single(553, "invalid recipient address"));
 		};
-		if !self.local_domains.contains(address.domain()) {
+		match self.directory.resolve(&address) {
 			// Not one of our domains: this server does not relay.
-			return Action::Continue(Reply::single(550, "5.7.1 relaying denied"));
+			Resolution::NotLocal => {
+				return Action::Continue(Reply::single(550, "5.7.1 relaying denied"));
+			}
+			Resolution::UnknownUser => {
+				return Action::Continue(Reply::single(550, "5.1.1 no such user"));
+			}
+			Resolution::Account(_) => {}
 		}
 		let forward_path = address.to_string();
 		match &mut self.state {
@@ -281,12 +287,21 @@ impl Session {
 mod tests {
 	use super::*;
 
-	fn test_domains() -> Arc<HashSet<String>> {
-		Arc::new(HashSet::from(["example.org".to_string()]))
+	fn test_directory() -> Arc<Directory> {
+		let mut entries: Vec<(String, String)> = vec![
+			("b@example.org".to_string(), "bob".to_string()),
+			("bob@example.org".to_string(), "bob".to_string()),
+			("c@example.org".to_string(), "bob".to_string()),
+			("overflow@example.org".to_string(), "bob".to_string()),
+		];
+		for i in 0..=MAX_RECIPIENTS {
+			entries.push((format!("r{i}@example.org"), "bob".to_string()));
+		}
+		Arc::new(Directory::new(["example.org".to_string()], entries))
 	}
 
 	fn greeted() -> Session {
-		let mut session = Session::new("mail.example.org").with_local_domains(test_domains());
+		let mut session = Session::new("mail.example.org").with_directory(test_directory());
 		session.command_line("EHLO client.example.org");
 		session
 	}
@@ -407,6 +422,14 @@ mod tests {
 			reply_code(&session.command_line("RCPT TO:<b@EXAMPLE.ORG>")),
 			250
 		);
+	}
+
+	#[test]
+	fn unknown_user_in_local_domain_is_denied() {
+		let mut session = greeted();
+		session.command_line("MAIL FROM:<a@example.org>");
+		let action = session.command_line("RCPT TO:<stranger@example.org>");
+		assert_eq!(reply_code(&action), 550);
 	}
 
 	#[test]

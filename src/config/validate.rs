@@ -11,7 +11,59 @@ impl Config {
 		validate_dns_name("hostname", &self.hostname)?;
 		self.validate_data_dir()?;
 		self.validate_domains()?;
+		self.validate_accounts()?;
 		self.validate_listeners()?;
+		Ok(())
+	}
+
+	fn validate_accounts(&self) -> Result<(), ConfigError> {
+		let domains: HashSet<String> = self
+			.domains
+			.iter()
+			.map(|domain| domain.to_ascii_lowercase())
+			.collect();
+		let mut names = HashSet::new();
+		let mut addresses = HashSet::new();
+		for account in &self.accounts {
+			let name = &account.name;
+			// The name becomes a directory under data_dir: keep it boring.
+			let safe_name = !name.is_empty()
+				&& name.len() <= 64
+				&& name
+					.chars()
+					.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+				&& !name.starts_with('-');
+			if !safe_name {
+				return Err(ConfigError::Invalid(format!(
+					"account name \"{name}\" must be lowercase alphanumeric/hyphen"
+				)));
+			}
+			if !names.insert(name.clone()) {
+				return Err(ConfigError::Invalid(format!(
+					"duplicate account name \"{name}\""
+				)));
+			}
+			if account.addresses.is_empty() {
+				return Err(ConfigError::Invalid(format!(
+					"account \"{name}\" has no addresses"
+				)));
+			}
+			for raw in &account.addresses {
+				let address = crate::smtp::address::Address::parse(raw).map_err(|_| {
+					ConfigError::Invalid(format!("account \"{name}\": invalid address \"{raw}\""))
+				})?;
+				if !domains.contains(address.domain()) {
+					return Err(ConfigError::Invalid(format!(
+						"account \"{name}\": address \"{raw}\" is not in a configured domain"
+					)));
+				}
+				if !addresses.insert(address.to_string().to_ascii_lowercase()) {
+					return Err(ConfigError::Invalid(format!(
+						"address \"{raw}\" is assigned to more than one account"
+					)));
+				}
+			}
+		}
 		Ok(())
 	}
 
@@ -275,6 +327,107 @@ domains = ["nodot"]
 hostname = "mail.example.org"
 data_dir = "/var/lib/mail"
 domains = ["example.org", "EXAMPLE.org"]
+"#,
+		);
+		assert!(matches!(result, Err(ConfigError::Invalid(_))));
+	}
+
+	#[test]
+	fn accepts_valid_accounts() {
+		let result = config_from(
+			r#"
+hostname = "mail.example.org"
+data_dir = "/var/lib/mail"
+domains = ["example.org"]
+
+[[accounts]]
+name = "alice"
+addresses = ["alice@example.org", "postmaster@EXAMPLE.org"]
+"#,
+		);
+		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn rejects_account_with_unsafe_name() {
+		for name in ["", "Alice", "a/b", "-x", "a b"] {
+			let result = config_from(&format!(
+				"hostname = \"mail.example.org\"\ndata_dir = \"/var/lib/mail\"\ndomains = [\"example.org\"]\n\n[[accounts]]\nname = \"{name}\"\naddresses = [\"a@example.org\"]\n"
+			));
+			assert!(
+				matches!(result, Err(ConfigError::Invalid(_))),
+				"name {name:?} must be rejected"
+			);
+		}
+	}
+
+	#[test]
+	fn rejects_account_without_addresses() {
+		let result = config_from(
+			r#"
+hostname = "mail.example.org"
+data_dir = "/var/lib/mail"
+domains = ["example.org"]
+
+[[accounts]]
+name = "alice"
+addresses = []
+"#,
+		);
+		assert!(matches!(result, Err(ConfigError::Invalid(_))));
+	}
+
+	#[test]
+	fn rejects_address_outside_domains() {
+		let result = config_from(
+			r#"
+hostname = "mail.example.org"
+data_dir = "/var/lib/mail"
+domains = ["example.org"]
+
+[[accounts]]
+name = "alice"
+addresses = ["alice@elsewhere.example"]
+"#,
+		);
+		assert!(matches!(result, Err(ConfigError::Invalid(_))));
+	}
+
+	#[test]
+	fn rejects_address_claimed_twice() {
+		let result = config_from(
+			r#"
+hostname = "mail.example.org"
+data_dir = "/var/lib/mail"
+domains = ["example.org"]
+
+[[accounts]]
+name = "alice"
+addresses = ["shared@example.org"]
+
+[[accounts]]
+name = "bob"
+addresses = ["SHARED@example.org"]
+"#,
+		);
+		assert!(matches!(result, Err(ConfigError::Invalid(_))));
+	}
+
+	#[test]
+	fn rejects_duplicate_account_names() {
+		let result = config_from(
+			r#"
+hostname = "mail.example.org"
+data_dir = "/var/lib/mail"
+domains = ["example.org"]
+
+[[accounts]]
+name = "alice"
+addresses = ["a@example.org"]
+
+[[accounts]]
+name = "alice"
+addresses = ["b@example.org"]
 "#,
 		);
 		assert!(matches!(result, Err(ConfigError::Invalid(_))));

@@ -6,9 +6,10 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::config::{Config, ListenerKind};
+use crate::smtp::directory::Directory;
 use crate::smtp::server::{Server, TlsMode};
 use crate::smtp::sink::MessageSink;
-use crate::storage::FsSpool;
+use crate::storage::LocalDelivery;
 
 /// Run the server with a validated configuration.
 pub fn run(config: Config) -> ExitCode {
@@ -34,17 +35,22 @@ async fn serve(config: Config) -> std::io::Result<()> {
 		return Ok(());
 	}
 
-	// Accepted messages land in the filesystem spool under data_dir.
-	let sink: Arc<dyn MessageSink> = Arc::new(FsSpool::open(&config.data_dir)?);
+	// Recipient resolution shared by sessions and delivery.
+	let directory = Arc::new(Directory::new(
+		config.domains.iter().cloned(),
+		config.accounts.iter().flat_map(|account| {
+			account
+				.addresses
+				.iter()
+				.map(|address| (address.clone(), account.name.clone()))
+		}),
+	));
 
-	// Domain matching is case-insensitive: store lowercase.
-	let local_domains = Arc::new(
-		config
-			.domains
-			.iter()
-			.map(|domain| domain.to_ascii_lowercase())
-			.collect::<std::collections::HashSet<_>>(),
-	);
+	// Accepted inbound mail is delivered to account mailboxes.
+	let sink: Arc<dyn MessageSink> = Arc::new(LocalDelivery::new(
+		&config.data_dir,
+		Arc::clone(&directory),
+	)?);
 
 	// TLS is loaded once and shared; failure to load is fatal (fail closed).
 	let tls_acceptor = match &config.tls {
@@ -64,7 +70,7 @@ async fn serve(config: Config) -> std::io::Result<()> {
 					_ => TlsMode::Opportunistic,
 				};
 				let mut server = Server::new(&config.hostname, Arc::clone(&sink))
-					.with_local_domains(Arc::clone(&local_domains));
+					.with_directory(Arc::clone(&directory));
 				if let Some(acceptor) = &tls_acceptor {
 					server = server.with_tls(acceptor.clone(), mode);
 				}

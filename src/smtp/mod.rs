@@ -5,6 +5,7 @@
 
 pub mod address;
 pub mod command;
+pub mod directory;
 pub mod line;
 pub mod reply;
 pub mod server;

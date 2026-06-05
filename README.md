@@ -21,7 +21,8 @@ flowchart LR
 - 📨 **SMTP server core** — strict RFC 5321 session handling: HELO/EHLO, MAIL FROM (with `SIZE`/`BODY`), RCPT TO, DATA, RSET, NOOP, QUIT
 - 🔐 **TLS everywhere** — STARTTLS (RFC 3207) on SMTP/submission, implicit TLS for `submissions`; rustls, no OpenSSL; broken TLS material refuses to start instead of degrading
 - 🛡️ **Smuggling-immune by construction** — bare CR, bare LF or NUL anywhere in the stream closes the connection; CRLF is enforced at the framing layer
-- 🚫 **No relay** — recipients outside the configured `domains` answer `550 5.7.1`; with no domains configured everything is denied (fail closed)
+- 🚫 **No relay, no ghosts** — recipients outside the configured `domains` answer `550 5.7.1`, unknown users in local domains answer `550 5.1.1`; with nothing configured everything is denied (fail closed)
+- 📬 **Local delivery** — accepted mail lands once per recipient account under `data_dir/accounts/<name>/new/`
 - 🔒 **Secure by default** — listeners bind to localhost unless explicitly configured otherwise; configuration fails closed on any unknown key or invalid value
 - 💾 **Crash-safe spool** — accepted messages are fsynced and atomically renamed before the server answers `250`
 - 🧰 **Operator CLI** — `mail serve`, `mail config-check`, meaningful exit codes
@@ -35,6 +36,10 @@ cat > mail.toml <<'EOF'
 hostname = "mail.example.org"
 data_dir = "/var/lib/mail"
 domains = ["example.org"]
+
+[[accounts]]
+name = "alice"
+addresses = ["alice@example.org", "postmaster@example.org"]
 
 [[listeners]]
 kind = "smtp"

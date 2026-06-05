@@ -6,6 +6,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
+use super::directory::Directory;
 use super::line::{LineDecoder, LineError};
 use super::reply::Reply;
 use super::session::{Action, Session};
@@ -40,19 +41,19 @@ pub struct Server {
 	sink: Arc<dyn MessageSink>,
 	tls: Option<TlsAcceptor>,
 	tls_mode: TlsMode,
-	local_domains: Arc<std::collections::HashSet<String>>,
+	directory: Arc<Directory>,
 }
 
 impl Server {
 	/// Create a plaintext server (STARTTLS unavailable). Without
-	/// `with_local_domains` every recipient is rejected (fail closed).
+	/// `with_directory` every recipient is rejected (fail closed).
 	pub fn new(hostname: &str, sink: Arc<dyn MessageSink>) -> Self {
 		Server {
 			hostname: hostname.to_string(),
 			sink,
 			tls: None,
 			tls_mode: TlsMode::Opportunistic,
-			local_domains: Arc::new(std::collections::HashSet::new()),
+			directory: Arc::new(Directory::default()),
 		}
 	}
 
@@ -63,14 +64,14 @@ impl Server {
 		self
 	}
 
-	/// Set the domains this server accepts mail for (lowercased).
-	pub fn with_local_domains(mut self, domains: Arc<std::collections::HashSet<String>>) -> Self {
-		self.local_domains = domains;
+	/// Set the directory used to resolve recipients.
+	pub fn with_directory(mut self, directory: Arc<Directory>) -> Self {
+		self.directory = directory;
 		self
 	}
 
 	fn new_session(&self) -> Session {
-		Session::new(&self.hostname).with_local_domains(Arc::clone(&self.local_domains))
+		Session::new(&self.hostname).with_directory(Arc::clone(&self.directory))
 	}
 
 	/// Accept connections forever. Each connection runs in its own task.
@@ -225,15 +226,22 @@ mod tests {
 	use super::*;
 	use crate::smtp::sink::MemorySink;
 
-	fn test_domains() -> Arc<std::collections::HashSet<String>> {
-		Arc::new(std::collections::HashSet::from(["example.org".to_string()]))
+	fn test_directory() -> Arc<Directory> {
+		Arc::new(Directory::new(
+			["example.org".to_string()],
+			[
+				("alice@example.org".to_string(), "alice".to_string()),
+				("bob@example.org".to_string(), "bob".to_string()),
+				("b@example.org".to_string(), "bob".to_string()),
+			],
+		))
 	}
 
 	/// Run one scripted client conversation, returning the full server output.
 	async fn converse(input: &[u8]) -> (String, Arc<MemorySink>) {
 		let sink = Arc::new(MemorySink::new());
 		let server = Server::new("mail.example.org", sink.clone() as Arc<dyn MessageSink>)
-			.with_local_domains(test_domains());
+			.with_directory(test_directory());
 
 		let (client, server_stream) = tokio::io::duplex(64 * 1024);
 		let task = tokio::spawn(async move { server.handle(server_stream).await });
@@ -365,7 +373,7 @@ DATA\r\n\
 		let (acceptor, cert) = crate::tls::test_support::acceptor_and_cert();
 		let sink = Arc::new(MemorySink::new());
 		let server = Server::new("mail.example.org", sink.clone() as Arc<dyn MessageSink>)
-			.with_local_domains(test_domains())
+			.with_directory(test_directory())
 			.with_tls(acceptor, TlsMode::Opportunistic);
 
 		let (mut client, server_stream) = tokio::io::duplex(64 * 1024);
@@ -457,7 +465,7 @@ DATA\r\n\
 			sink: sink as Arc<dyn MessageSink>,
 			tls: None,
 			tls_mode: TlsMode::Implicit,
-			local_domains: Arc::new(std::collections::HashSet::new()),
+			directory: Arc::new(Directory::default()),
 		};
 		let (_client, server_stream) = tokio::io::duplex(1024);
 		assert!(server.handle(server_stream).await.is_err());
