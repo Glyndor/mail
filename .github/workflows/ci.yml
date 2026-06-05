@@ -1,0 +1,15 @@
+name: CI
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    uses: Glyndor/.github/.github/workflows/rust-ci.yml@b85b07c45a1bda03e948bf78c645b5f9f59266dc
+    with:
+      coverage-threshold: 90
