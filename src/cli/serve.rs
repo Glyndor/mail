@@ -110,6 +110,23 @@ async fn serve(config: Config) -> std::io::Result<()> {
 						.map_err(std::io::Error::other)
 				}));
 			}
+			ListenerKind::Imaps => {
+				let Some(acceptor) = &tls_acceptor else {
+					return Err(std::io::Error::other(
+						"imaps listener without TLS configured",
+					));
+				};
+				let addr = listener_config.socket_addr();
+				let listener = TcpListener::bind(addr).await?;
+				tracing::info!(%addr, kind = ?listener_config.kind, "listening");
+				let server = Arc::new(crate::imap::server::Server::new(
+					&config.hostname,
+					config.data_dir.clone(),
+					Arc::clone(&directory),
+					acceptor.clone(),
+				));
+				tasks.push(tokio::spawn(server.serve(listener)));
+			}
 			ListenerKind::Smtp | ListenerKind::Submission | ListenerKind::Submissions => {
 				let addr = listener_config.socket_addr();
 				let listener = TcpListener::bind(addr).await?;
