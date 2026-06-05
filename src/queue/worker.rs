@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::smtp::address::Address;
+use crate::smtp::sink::MessageSink;
 use crate::storage::FsSpool;
 
 use super::client::{self, DeliveryError};
@@ -20,6 +21,8 @@ pub struct Worker {
 	connector: Arc<dyn Connector>,
 	ehlo_hostname: String,
 	attempts: std::sync::Mutex<BTreeMap<uuid::Uuid, u32>>,
+	/// Where bounces are delivered. `None` drops them with a warning.
+	bounce_sink: Option<Arc<dyn MessageSink>>,
 }
 
 impl Worker {
@@ -30,6 +33,38 @@ impl Worker {
 			connector,
 			ehlo_hostname: ehlo_hostname.to_string(),
 			attempts: std::sync::Mutex::new(BTreeMap::new()),
+			bounce_sink: None,
+		}
+	}
+
+	/// Deliver bounces for failed mail through this sink.
+	pub fn with_bounce_sink(mut self, sink: Arc<dyn MessageSink>) -> Self {
+		self.bounce_sink = Some(sink);
+		self
+	}
+
+	/// Generate and deliver a bounce for a dropped spool entry.
+	fn bounce(&self, id: uuid::Uuid, reason: &str) {
+		let Ok(entry) = self.spool.load(id) else {
+			return;
+		};
+		let Some(message) = super::bounce::build(
+			&self.ehlo_hostname,
+			&entry.envelope.reverse_path,
+			&entry.envelope.recipients,
+			reason,
+			&entry.data,
+			std::time::SystemTime::now(),
+		) else {
+			return;
+		};
+		match &self.bounce_sink {
+			Some(sink) => {
+				if let Err(error) = sink.deliver(message) {
+					tracing::warn!(%id, %error, "bounce delivery failed");
+				}
+			}
+			None => tracing::warn!(%id, "dropping bounce: no bounce sink configured"),
 		}
 	}
 
@@ -55,6 +90,7 @@ impl Worker {
 				}
 				Outcome::Dropped(reason) => {
 					tracing::warn!(%id, %reason, "dropping undeliverable message");
+					self.bounce(id, &reason);
 					self.spool.remove(id)?;
 					self.attempts.lock().expect("attempts mutex").remove(&id);
 				}
@@ -67,6 +103,7 @@ impl Worker {
 					};
 					if attempts >= MAX_ATTEMPTS {
 						tracing::warn!(%id, %reason, attempts, "giving up on message");
+						self.bounce(id, &reason);
 						self.spool.remove(id)?;
 						self.attempts.lock().expect("attempts mutex").remove(&id);
 					} else {
@@ -210,7 +247,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn permanent_rejection_drops_the_entry() {
+	async fn permanent_rejection_drops_and_bounces() {
 		let dir = tempfile::tempdir().expect("tempdir");
 		// The loopback server only knows bob@; carol@ gets 550.
 		let spool = spool_with_message(dir.path(), "carol@remote.example");
@@ -219,14 +256,42 @@ mod tests {
 			sink: sink.clone(),
 			domain: "remote.example".to_string(),
 		});
+		let bounce_sink = Arc::new(MemorySink::new());
 
-		let worker = Worker::new(spool, connector, "mail.sender.example");
+		let worker = Worker::new(spool, connector, "mail.sender.example")
+			.with_bounce_sink(bounce_sink.clone() as Arc<dyn MessageSink>);
 		let delivered = worker.pass().await.expect("pass");
 
 		assert_eq!(delivered, 0);
 		// Dropped, not retried: the spool is empty and nothing arrived.
 		assert!(worker.spool.list().expect("list").is_empty());
 		assert!(sink.messages().is_empty());
+
+		// The sender got a bounce with the null reverse-path.
+		let bounces = bounce_sink.messages();
+		assert_eq!(bounces.len(), 1);
+		assert_eq!(bounces[0].reverse_path, "");
+		assert_eq!(
+			bounces[0].recipients,
+			vec!["alice@sender.example".to_string()]
+		);
+		let body = String::from_utf8(bounces[0].data.clone()).expect("ascii");
+		assert!(body.contains("carol@remote.example"), "{body}");
+	}
+
+	#[tokio::test]
+	async fn retry_exhaustion_bounces_once() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let spool = spool_with_message(dir.path(), "bob@remote.example");
+		let bounce_sink = Arc::new(MemorySink::new());
+		let worker = Worker::new(spool, Arc::new(DownConnector), "mail.sender.example")
+			.with_bounce_sink(bounce_sink.clone() as Arc<dyn MessageSink>);
+
+		for _ in 0..MAX_ATTEMPTS {
+			let _ = worker.pass().await.expect("pass");
+		}
+		assert!(worker.spool.list().expect("list").is_empty());
+		assert_eq!(bounce_sink.messages().len(), 1);
 	}
 
 	#[tokio::test]
