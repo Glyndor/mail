@@ -35,6 +35,13 @@ impl LineDecoder {
 		self.buffer.extend_from_slice(bytes);
 	}
 
+	/// Drain up to `max` already-buffered bytes (for literal payloads that
+	/// arrived in the same read as their command line).
+	pub fn take_buffered(&mut self, max: usize) -> Vec<u8> {
+		let take = self.buffer.len().min(max);
+		self.buffer.drain(..take).collect()
+	}
+
 	/// Try to extract the next complete line (without CRLF). Returns
 	/// `Ok(None)` when more bytes are needed.
 	pub fn next_line(&mut self) -> Result<Option<Vec<u8>>, LineError> {
@@ -110,6 +117,15 @@ mod tests {
 		assert_eq!(decoder.next_line(), Ok(None));
 		decoder.feed(b"\n");
 		assert_eq!(decoder.next_line(), Ok(Some(b"NOOP".to_vec())));
+	}
+
+	#[test]
+	fn take_buffered_drains_up_to_max() {
+		let mut decoder = LineDecoder::new();
+		decoder.feed(b"hello world");
+		assert_eq!(decoder.take_buffered(5), b"hello");
+		assert_eq!(decoder.take_buffered(100), b" world");
+		assert!(decoder.take_buffered(10).is_empty());
 	}
 
 	#[test]

@@ -181,6 +181,29 @@ impl Snapshot {
 	}
 }
 
+/// Append a message to an account's INBOX crash-safely, with flags.
+/// Standalone because APPEND may target a mailbox that is not selected.
+pub fn append(
+	data_dir: &Path,
+	account: &str,
+	flags: &[Flag],
+	data: &[u8],
+) -> std::io::Result<Uuid> {
+	let account_dir = data_dir.join("accounts").join(account).join("new");
+	let tmp_dir = data_dir.join("accounts").join(account).join("tmp");
+	std::fs::create_dir_all(&account_dir)?;
+	std::fs::create_dir_all(&tmp_dir)?;
+
+	let id = Uuid::now_v7();
+	let tmp = tmp_dir.join(format!("{id}.eml"));
+	std::fs::write(&tmp, data)?;
+	std::fs::rename(&tmp, account_dir.join(format!("{id}.eml")))?;
+	if !flags.is_empty() {
+		write_flags(&account_dir, id, flags)?;
+	}
+	Ok(id)
+}
+
 fn read_flags(account_dir: &Path, id: Uuid) -> Vec<Flag> {
 	std::fs::read(account_dir.join(format!("{id}.flags")))
 		.ok()

@@ -15,6 +15,11 @@ pub struct Output {
 	pub bytes: Vec<u8>,
 	/// Close the connection after sending.
 	pub close: bool,
+	/// After sending, read exactly this many literal bytes and feed them
+	/// to [`Session::literal_done`].
+	pub collect_literal: Option<usize>,
+	/// After sending, read lines until `DONE` and call [`Session::idle_done`].
+	pub idle: bool,
 }
 
 impl Output {
@@ -22,6 +27,8 @@ impl Output {
 		Output {
 			bytes: text.into_bytes(),
 			close: false,
+			collect_literal: None,
+			idle: false,
 		}
 	}
 
@@ -29,6 +36,8 @@ impl Output {
 		Output {
 			bytes: text.into_bytes(),
 			close: true,
+			collect_literal: None,
+			idle: false,
 		}
 	}
 }
@@ -53,6 +62,8 @@ pub struct Session {
 	data_dir: PathBuf,
 	directory: Arc<Directory>,
 	state: State,
+	/// In-flight APPEND: (tag, flags) while the literal arrives.
+	pending_append: Option<(String, Vec<Flag>)>,
 }
 
 const CAPABILITIES: &str = "IMAP4rev2 AUTH=PLAIN";
@@ -65,6 +76,7 @@ impl Session {
 			data_dir,
 			directory,
 			state: State::NotAuthenticated { login_failures: 0 },
+			pending_append: None,
 		}
 	}
 
@@ -109,6 +121,21 @@ impl Session {
 			Command::Examine { mailbox } => self.select(&tag, &mailbox, true),
 			Command::Close => self.close(&tag),
 			Command::Expunge => self.expunge(&tag),
+			Command::Idle => {
+				if self.account().is_none() {
+					return Output::text(format!("{tag} NO not authenticated\r\n"));
+				}
+				let mut output = Output::text("+ idling\r\n".to_string());
+				output.idle = true;
+				// The tag is needed when DONE arrives.
+				self.pending_append = Some((tag, Vec::new()));
+				output
+			}
+			Command::Append {
+				mailbox,
+				flags,
+				size,
+			} => self.append_begin(&tag, &mailbox, &flags, size),
 			Command::Fetch {
 				sequence,
 				items,
@@ -306,6 +333,54 @@ impl Session {
 		}
 	}
 
+	fn append_begin(
+		&mut self,
+		tag: &str,
+		mailbox: &str,
+		flag_tokens: &[String],
+		size: usize,
+	) -> Output {
+		if self.account().is_none() {
+			return Output::text(format!("{tag} NO not authenticated\r\n"));
+		}
+		if !mailbox.eq_ignore_ascii_case("INBOX") {
+			return Output::text(format!("{tag} NO [TRYCREATE] no such mailbox\r\n"));
+		}
+		let mut flags = Vec::with_capacity(flag_tokens.len());
+		for token in flag_tokens {
+			match Flag::parse(token) {
+				Some(flag) => flags.push(flag),
+				None => return Output::text(format!("{tag} BAD unsupported flag\r\n")),
+			}
+		}
+		self.pending_append = Some((tag.to_string(), flags));
+		let mut output = Output::text("+ ready for literal data\r\n".to_string());
+		output.collect_literal = Some(size);
+		output
+	}
+
+	/// Called by the network layer with the complete APPEND literal.
+	pub fn literal_done(&mut self, data: &[u8]) -> Output {
+		let Some((tag, flags)) = self.pending_append.take() else {
+			return Output::text("* BAD unexpected literal\r\n".to_string());
+		};
+		let Some(account) = self.account().map(str::to_string) else {
+			return Output::text(format!("{tag} NO not authenticated\r\n"));
+		};
+		match super::mailbox::append(&self.data_dir, &account, &flags, data) {
+			Ok(_) => Output::text(format!("{tag} OK APPEND completed\r\n")),
+			Err(_) => Output::text(format!("{tag} NO APPEND failed\r\n")),
+		}
+	}
+
+	/// Called by the network layer when an IDLE ends with DONE.
+	pub fn idle_done(&mut self) -> Output {
+		match self.pending_append.take() {
+			Some((tag, _)) => Output::text(format!("{tag} OK IDLE terminated\r\n")),
+			None => Output::text("* BAD not idling\r\n".to_string()),
+		}
+	}
+
 	fn close(&mut self, tag: &str) -> Output {
 		match &self.state {
 			State::Selected { account, .. } => {
@@ -382,6 +457,8 @@ impl Session {
 		Output {
 			bytes,
 			close: false,
+			collect_literal: None,
+			idle: false,
 		}
 	}
 }
@@ -609,6 +686,71 @@ mod tests {
 		session.command_line("a2 SELECT INBOX");
 		let output = session.command_line(r"a3 STORE 1 +FLAGS (\Recent)");
 		assert!(text(&output).contains("a3 BAD"), "{}", text(&output));
+	}
+
+	#[test]
+	fn append_stores_message_with_flags() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let mut session = logged_in(dir.path());
+
+		let output = session.command_line(r"a2 APPEND INBOX (\Seen) {14}");
+		assert_eq!(output.collect_literal, Some(14));
+		assert!(text(&output).starts_with("+ "), "{}", text(&output));
+
+		let output = session.literal_done(b"Subject: bye\r\n");
+		assert!(text(&output).contains("a2 OK"), "{}", text(&output));
+
+		// The appended message is visible on SELECT, with its flag.
+		let output = session.command_line("a3 SELECT INBOX");
+		assert!(text(&output).contains("* 1 EXISTS"), "{}", text(&output));
+		let output = session.command_line("a4 FETCH 1 (FLAGS BODY[])");
+		let response = text(&output);
+		assert!(response.contains(r"FLAGS (\Seen)"), "{response}");
+		assert!(response.contains("Subject: bye"), "{response}");
+	}
+
+	#[test]
+	fn append_requires_authentication_and_known_mailbox() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let mut session = Session::new("mail.example.org", dir.path().to_path_buf(), directory());
+		let output = session.command_line("a1 APPEND INBOX {5}");
+		assert!(text(&output).contains("a1 NO"));
+		assert_eq!(output.collect_literal, None);
+
+		let mut session = logged_in(dir.path());
+		let output = session.command_line("a2 APPEND Archive {5}");
+		assert!(text(&output).contains("TRYCREATE"), "{}", text(&output));
+	}
+
+	#[test]
+	fn unexpected_literal_is_rejected() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let mut session = logged_in(dir.path());
+		let output = session.literal_done(b"stray");
+		assert!(text(&output).contains("BAD"), "{}", text(&output));
+	}
+
+	#[test]
+	fn idle_flow() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let mut session = logged_in(dir.path());
+		let output = session.command_line("a2 IDLE");
+		assert!(output.idle);
+		assert!(text(&output).starts_with("+ "));
+		let output = session.idle_done();
+		assert!(text(&output).contains("a2 OK"), "{}", text(&output));
+		// A second DONE without IDLE is an error.
+		let output = session.idle_done();
+		assert!(text(&output).contains("BAD"));
+	}
+
+	#[test]
+	fn idle_requires_authentication() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let mut session = Session::new("mail.example.org", dir.path().to_path_buf(), directory());
+		let output = session.command_line("a1 IDLE");
+		assert!(text(&output).contains("a1 NO"));
+		assert!(!output.idle);
 	}
 
 	#[test]
