@@ -19,6 +19,12 @@ pub struct Envelope {
 	pub reverse_path: String,
 	/// Accepted recipients.
 	pub recipients: Vec<String>,
+	/// Failed delivery attempts so far.
+	#[serde(default)]
+	pub attempts: u32,
+	/// Epoch seconds before which delivery must not be retried.
+	#[serde(default)]
+	pub next_attempt: u64,
 }
 
 /// One spooled message: envelope plus raw message bytes.
@@ -54,6 +60,8 @@ impl FsSpool {
 			id,
 			reverse_path: message.reverse_path.clone(),
 			recipients: message.recipients.clone(),
+			attempts: 0,
+			next_attempt: 0,
 		};
 
 		let tmp_message = self.root.join("tmp").join(format!("{id}.eml"));
@@ -97,6 +105,20 @@ impl FsSpool {
 		// UUID v7 sorts chronologically.
 		ids.sort();
 		Ok(ids)
+	}
+
+	/// Record a failed delivery attempt crash-safely, returning the new
+	/// attempt count. `next_attempt` is when the next retry is allowed.
+	pub fn record_attempt(&self, id: Uuid, next_attempt: u64) -> std::io::Result<u32> {
+		let mut entry = self.load(id)?;
+		entry.envelope.attempts += 1;
+		entry.envelope.next_attempt = next_attempt;
+
+		let tmp = self.root.join("tmp").join(format!("{id}.json"));
+		let bytes = serde_json::to_vec(&entry.envelope).map_err(std::io::Error::other)?;
+		write_sync(&tmp, &bytes)?;
+		fs::rename(&tmp, self.root.join("new").join(format!("{id}.json")))?;
+		Ok(entry.envelope.attempts)
 	}
 
 	/// Remove a spooled message after successful processing.
