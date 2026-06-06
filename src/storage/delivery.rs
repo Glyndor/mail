@@ -3,7 +3,6 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use uuid::Uuid;
 
