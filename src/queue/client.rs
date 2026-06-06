@@ -230,7 +230,7 @@ mod tests {
 		use crate::smtp::sink::{MemorySink, MessageSink};
 
 		let sink = Arc::new(MemorySink::new());
-		let directory = Arc::new(Directory::new(
+		let directory = crate::directory_store::DirectoryHandle::new(Directory::new(
 			["example.org".to_string()],
 			[("bob@example.org".to_string(), "bob".to_string())],
 		));
@@ -268,8 +268,12 @@ mod tests {
 		use crate::smtp::sink::{MemorySink, MessageSink};
 
 		let sink = Arc::new(MemorySink::new());
-		let server = Server::new("mx.example.org", sink as Arc<dyn MessageSink>)
-			.with_directory(Arc::new(Directory::new(["example.org".to_string()], [])));
+		let server = Server::new("mx.example.org", sink as Arc<dyn MessageSink>).with_directory(
+			crate::directory_store::DirectoryHandle::new(Directory::new(
+				["example.org".to_string()],
+				[],
+			)),
+		);
 
 		let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
 		let task = tokio::spawn(async move { server.handle(server_stream, None).await });

@@ -12,6 +12,7 @@ use super::line::{LineDecoder, LineError};
 use super::reply::Reply;
 use super::session::{Action, Session};
 use super::sink::MessageSink;
+use crate::directory_store::DirectoryHandle;
 
 /// Read buffer size per connection.
 const READ_BUFFER: usize = 4096;
@@ -43,7 +44,7 @@ pub struct Server {
 	sink: Arc<dyn MessageSink>,
 	tls: Option<TlsAcceptor>,
 	tls_mode: TlsMode,
-	directory: Arc<Directory>,
+	directory: DirectoryHandle,
 	spf: Option<Arc<dyn crate::spf::DnsLookup>>,
 }
 
@@ -56,7 +57,7 @@ impl Server {
 			sink,
 			tls: None,
 			tls_mode: TlsMode::Opportunistic,
-			directory: Arc::new(Directory::default()),
+			directory: DirectoryHandle::new(Directory::default()),
 			spf: None,
 		}
 	}
@@ -74,14 +75,15 @@ impl Server {
 		self
 	}
 
-	/// Set the directory used to resolve recipients.
-	pub fn with_directory(mut self, directory: Arc<Directory>) -> Self {
+	/// Set the directory handle used to resolve recipients. Sessions
+	/// snapshot it at connection start.
+	pub fn with_directory(mut self, directory: DirectoryHandle) -> Self {
 		self.directory = directory;
 		self
 	}
 
 	fn new_session(&self) -> Session {
-		Session::new(&self.hostname).with_directory(Arc::clone(&self.directory))
+		Session::new(&self.hostname).with_directory(self.directory.current())
 	}
 
 	/// Accept connections forever. Each connection runs in its own task.
@@ -388,8 +390,8 @@ mod tests {
 	use super::*;
 	use crate::smtp::sink::MemorySink;
 
-	fn test_directory() -> Arc<Directory> {
-		Arc::new(Directory::new(
+	fn test_directory() -> DirectoryHandle {
+		DirectoryHandle::new(Directory::new(
 			["example.org".to_string()],
 			[
 				("alice@example.org".to_string(), "alice".to_string()),
@@ -735,7 +737,7 @@ QUIT\r\n";
 			sink: sink as Arc<dyn MessageSink>,
 			tls: None,
 			tls_mode: TlsMode::Implicit,
-			directory: Arc::new(Directory::default()),
+			directory: DirectoryHandle::new(Directory::default()),
 			spf: None,
 		};
 		let (_client, server_stream) = tokio::io::duplex(1024);

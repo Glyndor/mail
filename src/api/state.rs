@@ -6,7 +6,7 @@ use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
 
-use crate::config::Account;
+use crate::directory_store::AccountStore;
 use crate::storage::FsSpool;
 
 use super::error::ApiError;
@@ -21,7 +21,7 @@ struct Inner {
 	/// argon2id PHC hash of the API token.
 	token_hash: String,
 	domains: Vec<String>,
-	accounts: Vec<AccountView>,
+	store: Arc<AccountStore>,
 	spool: FsSpool,
 }
 
@@ -30,6 +30,8 @@ struct Inner {
 pub struct AccountView {
 	pub name: String,
 	pub addresses: Vec<String>,
+	/// Whether the account is API-managed (deletable) or from the config.
+	pub dynamic: bool,
 }
 
 impl ApiState {
@@ -37,20 +39,14 @@ impl ApiState {
 	pub fn new(
 		token_hash: &str,
 		domains: Vec<String>,
-		accounts: &[Account],
+		store: Arc<AccountStore>,
 		spool: FsSpool,
 	) -> Self {
 		ApiState {
 			inner: Arc::new(Inner {
 				token_hash: token_hash.to_string(),
 				domains,
-				accounts: accounts
-					.iter()
-					.map(|account| AccountView {
-						name: account.name.clone(),
-						addresses: account.addresses.clone(),
-					})
-					.collect(),
+				store,
 				spool,
 			}),
 		}
@@ -60,8 +56,21 @@ impl ApiState {
 		&self.inner.domains
 	}
 
-	pub fn accounts(&self) -> &[AccountView] {
-		&self.inner.accounts
+	pub fn accounts(&self) -> Vec<AccountView> {
+		self.inner
+			.store
+			.account_views()
+			.into_iter()
+			.map(|(name, addresses, dynamic)| AccountView {
+				name,
+				addresses,
+				dynamic,
+			})
+			.collect()
+	}
+
+	pub fn store(&self) -> &AccountStore {
+		&self.inner.store
 	}
 
 	pub fn spool(&self) -> &FsSpool {

@@ -8,6 +8,7 @@ pub mod api;
 pub mod cli;
 pub mod clock;
 pub mod config;
+pub mod directory_store;
 pub mod dkim;
 pub mod dmarc;
 pub mod imap;

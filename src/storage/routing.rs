@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
+use crate::directory_store::DirectoryHandle;
 use crate::smtp::address::Address;
-use crate::smtp::directory::{Directory, Resolution};
+use crate::smtp::directory::Resolution;
 use crate::smtp::session::AcceptedMessage;
 use crate::smtp::sink::{MessageSink, SinkError};
 
@@ -13,7 +14,7 @@ use super::spool::FsSpool;
 /// Splits an accepted message between local mailbox delivery and the
 /// outbound spool, according to the directory.
 pub struct SplitDelivery {
-	directory: Arc<Directory>,
+	directory: DirectoryHandle,
 	local: LocalDelivery,
 	outbound: FsSpool,
 	signer: Option<Arc<crate::dkim::Signer>>,
@@ -21,9 +22,9 @@ pub struct SplitDelivery {
 
 impl SplitDelivery {
 	/// Create the routing sink rooted at `data_dir`.
-	pub fn new(data_dir: &std::path::Path, directory: Arc<Directory>) -> std::io::Result<Self> {
+	pub fn new(data_dir: &std::path::Path, directory: DirectoryHandle) -> std::io::Result<Self> {
 		Ok(SplitDelivery {
-			local: LocalDelivery::new(data_dir, Arc::clone(&directory))?,
+			local: LocalDelivery::new(data_dir, directory.clone())?,
 			outbound: FsSpool::open(data_dir)?,
 			directory,
 			signer: None,
@@ -45,7 +46,7 @@ impl MessageSink for SplitDelivery {
 			let address = Address::parse(recipient).map_err(|_| {
 				SinkError::Unavailable(format!("unparseable recipient {recipient}"))
 			})?;
-			match self.directory.resolve(&address) {
+			match self.directory.current().resolve(&address) {
 				Resolution::Account(_) => local.push(recipient.clone()),
 				Resolution::NotLocal => remote.push(recipient.clone()),
 				// The session rejected unknown local users; drift here is
@@ -91,8 +92,8 @@ mod tests {
 	use super::*;
 	use std::fs;
 
-	fn directory() -> Arc<Directory> {
-		Arc::new(Directory::new(
+	fn directory() -> DirectoryHandle {
+		DirectoryHandle::new(crate::smtp::directory::Directory::new(
 			["example.org".to_string()],
 			[("alice@example.org".to_string(), "alice".to_string())],
 		))

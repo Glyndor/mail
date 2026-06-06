@@ -6,7 +6,6 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::config::{Config, ListenerKind};
-use crate::smtp::directory::Directory;
 use crate::smtp::server::{Server, TlsMode};
 use crate::smtp::sink::MessageSink;
 use crate::storage::SplitDelivery;
@@ -35,28 +34,21 @@ async fn serve(config: Config) -> std::io::Result<()> {
 		return Ok(());
 	}
 
-	// Recipient resolution and credentials shared by sessions and delivery.
-	let directory = Arc::new(
-		Directory::new(
-			config.domains.iter().cloned(),
-			config.accounts.iter().flat_map(|account| {
-				account
-					.addresses
-					.iter()
-					.map(|address| (address.clone(), account.name.clone()))
-			}),
+	// Recipient resolution and credentials: static config plus the
+	// API-managed dynamic accounts, hot-swapped on mutation.
+	let account_store = Arc::new(
+		crate::directory_store::AccountStore::open(
+			&config.data_dir,
+			config.domains.clone(),
+			config.accounts.clone(),
 		)
-		.with_password_hashes(config.accounts.iter().filter_map(|account| {
-			account
-				.password_hash
-				.as_ref()
-				.map(|hash| (account.name.clone(), hash.clone()))
-		})),
+		.map_err(|error| std::io::Error::other(error.to_string()))?,
 	);
+	let directory = account_store.handle();
 
 	// Local recipients go to account mailboxes; authenticated relay mail
 	// is queued in the outbound spool, DKIM-signed when configured.
-	let mut split = SplitDelivery::new(&config.data_dir, Arc::clone(&directory))?;
+	let mut split = SplitDelivery::new(&config.data_dir, directory.clone())?;
 	if let Some(dkim) = &config.dkim {
 		let signer = crate::dkim::Signer::load(&dkim.selector, &dkim.key_file)
 			.map_err(std::io::Error::other)?;
@@ -103,7 +95,7 @@ async fn serve(config: Config) -> std::io::Result<()> {
 				let state = crate::api::ApiState::new(
 					&api.token_hash,
 					config.domains.clone(),
-					&config.accounts,
+					Arc::clone(&account_store),
 					crate::storage::FsSpool::open(&config.data_dir)?,
 				);
 				let addr = listener_config.socket_addr();
@@ -132,7 +124,7 @@ async fn serve(config: Config) -> std::io::Result<()> {
 				let server = Arc::new(crate::imap::server::Server::new(
 					&config.hostname,
 					config.data_dir.clone(),
-					Arc::clone(&directory),
+					directory.clone(),
 					acceptor.clone(),
 					mode,
 				));
@@ -147,7 +139,7 @@ async fn serve(config: Config) -> std::io::Result<()> {
 					_ => TlsMode::Opportunistic,
 				};
 				let mut server = Server::new(&config.hostname, Arc::clone(&sink))
-					.with_directory(Arc::clone(&directory))
+					.with_directory(directory.clone())
 					.with_spf(Arc::clone(&spf_dns));
 				if let Some(acceptor) = &tls_acceptor {
 					server = server.with_tls(acceptor.clone(), mode);
