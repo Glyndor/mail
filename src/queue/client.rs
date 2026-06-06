@@ -42,6 +42,7 @@ pub async fn deliver<S>(
 	reverse_path: &str,
 	recipients: &[String],
 	data: &[u8],
+	require_tls: bool,
 ) -> Result<(), DeliveryError>
 where
 	S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -51,6 +52,12 @@ where
 
 	conn.command(&format!("EHLO {ehlo_hostname}"), 250).await?;
 	let offers_starttls = conn.last_reply_contains("STARTTLS");
+	if require_tls && !offers_starttls {
+		// MTA-STS enforce: never downgrade to plaintext; retry later.
+		return Err(DeliveryError::Transient(
+			"MTA-STS enforce but remote offers no STARTTLS".into(),
+		));
+	}
 
 	if offers_starttls {
 		conn.command("STARTTLS", 220).await?;
@@ -240,6 +247,7 @@ mod tests {
 			"alice@sender.example",
 			&["bob@example.org".to_string()],
 			b"Subject: hi\r\n\r\n.leading dot\r\nbody\r\n",
+			false,
 		)
 		.await
 		.expect("delivery succeeds");
@@ -273,6 +281,7 @@ mod tests {
 			"alice@sender.example",
 			&["unknown@example.org".to_string()],
 			b"body\r\n",
+			false,
 		)
 		.await;
 

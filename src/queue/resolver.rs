@@ -3,6 +3,8 @@
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
+use crate::mtasts::Policy;
+
 use super::client::DeliveryError;
 
 /// A bidirectional stream the SMTP client can drive.
@@ -20,7 +22,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> DynStream for T {}
 /// Opens a connection to the mail exchanger of a domain. Abstracted so the
 /// worker can be tested without DNS or network access.
 pub trait Connector: Send + Sync {
-	fn connect(&self, domain: &str) -> ConnectFuture<'_>;
+	/// Connect to an exchanger for `domain`. With an enforce-mode policy,
+	/// only policy-permitted MX hosts may be contacted.
+	fn connect(&self, domain: &str, policy: Option<&Policy>) -> ConnectFuture<'_>;
 }
 
 /// Real connector: system resolver for MX records, TCP to port 25.
@@ -79,10 +83,20 @@ impl MxConnector {
 }
 
 impl Connector for MxConnector {
-	fn connect(&self, domain: &str) -> ConnectFuture<'_> {
+	fn connect(&self, domain: &str, policy: Option<&Policy>) -> ConnectFuture<'_> {
 		let domain = domain.to_string();
+		let policy = policy.cloned();
 		Box::pin(async move {
-			let hosts = self.exchangers(&domain).await?;
+			let mut hosts = self.exchangers(&domain).await?;
+			if let Some(policy) = &policy {
+				hosts.retain(|host| policy.permits_mx(host));
+				if hosts.is_empty() {
+					// Never contact unlisted hosts under enforce: retry later.
+					return Err(DeliveryError::Transient(format!(
+						"no MTA-STS-permitted MX for {domain}"
+					)));
+				}
+			}
 			let mut last_error = DeliveryError::Transient(format!("no exchangers for {domain}"));
 			for host in hosts {
 				match TcpStream::connect((host.as_str(), 25)).await {
