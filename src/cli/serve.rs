@@ -69,13 +69,19 @@ async fn serve(config: Config) -> std::io::Result<()> {
 
 	// The queue worker drains the outbound spool in the background.
 	let connector = Arc::new(crate::queue::MxConnector::from_system()?);
+	let mta_sts = Arc::new(crate::mtasts::PolicyStore::new(Box::new(
+		crate::mtasts::SystemFetcher::new().map_err(|error| {
+			std::io::Error::other(format!("cannot build MTA-STS fetcher: {error:?}"))
+		})?,
+	)));
 	let worker = Arc::new(
 		crate::queue::Worker::new(
 			crate::storage::FsSpool::open(&config.data_dir)?,
 			connector,
 			&config.hostname,
 		)
-		.with_bounce_sink(Arc::clone(&sink)),
+		.with_bounce_sink(Arc::clone(&sink))
+		.with_mta_sts(mta_sts, Arc::clone(&spf_dns)),
 	);
 	tokio::spawn(worker.run(std::time::Duration::from_secs(30)));
 

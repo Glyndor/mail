@@ -11,6 +11,7 @@ pub mod config;
 pub mod dkim;
 pub mod dmarc;
 pub mod imap;
+pub mod mtasts;
 pub mod queue;
 pub mod smtp;
 pub mod spf;

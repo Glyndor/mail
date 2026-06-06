@@ -34,6 +34,11 @@ pub struct Worker {
 	ehlo_hostname: String,
 	/// Where bounces are delivered. `None` drops them with a warning.
 	bounce_sink: Option<Arc<dyn MessageSink>>,
+	/// MTA-STS policy store plus the DNS used for discovery.
+	mta_sts: Option<(
+		Arc<crate::mtasts::PolicyStore>,
+		Arc<dyn crate::spf::DnsLookup>,
+	)>,
 	/// Test override for "now" (epoch seconds); 0 means the real clock.
 	clock: std::sync::atomic::AtomicU64,
 }
@@ -46,8 +51,19 @@ impl Worker {
 			connector,
 			ehlo_hostname: ehlo_hostname.to_string(),
 			bounce_sink: None,
+			mta_sts: None,
 			clock: std::sync::atomic::AtomicU64::new(0),
 		}
+	}
+
+	/// Enforce MTA-STS policies on outbound delivery.
+	pub fn with_mta_sts(
+		mut self,
+		store: Arc<crate::mtasts::PolicyStore>,
+		dns: Arc<dyn crate::spf::DnsLookup>,
+	) -> Self {
+		self.mta_sts = Some((store, dns));
+		self
 	}
 
 	#[cfg(test)]
@@ -172,7 +188,24 @@ impl Worker {
 		}
 
 		for (domain, recipients) in by_domain {
-			let (stream, server_name) = match self.connector.connect(&domain).await {
+			// MTA-STS: an enforce policy constrains MX choice and mandates TLS.
+			let policy = match &self.mta_sts {
+				Some((store, dns)) => match store.policy(dns.as_ref(), &domain).await {
+					Ok(policy) => {
+						policy.filter(|policy| policy.mode == crate::mtasts::Mode::Enforce)
+					}
+					Err(crate::mtasts::PolicyError::Temporary(reason)) => {
+						return Outcome::Retry(reason);
+					}
+					// Malformed/absent policies fall back to opportunistic.
+					Err(_) => None,
+				},
+				None => None,
+			};
+			let require_tls = policy.is_some();
+
+			let (stream, server_name) = match self.connector.connect(&domain, policy.as_ref()).await
+			{
 				Ok(connection) => connection,
 				Err(DeliveryError::Transient(reason)) => return Outcome::Retry(reason),
 				Err(DeliveryError::Permanent(reason)) => return Outcome::Dropped(reason),
@@ -184,6 +217,7 @@ impl Worker {
 				&entry.envelope.reverse_path,
 				&recipients,
 				&entry.data,
+				require_tls,
 			)
 			.await;
 			match result {
@@ -219,7 +253,11 @@ mod tests {
 	}
 
 	impl Connector for LoopbackConnector {
-		fn connect(&self, _domain: &str) -> ConnectFuture<'_> {
+		fn connect(
+			&self,
+			_domain: &str,
+			_policy: Option<&crate::mtasts::Policy>,
+		) -> ConnectFuture<'_> {
 			Box::pin(async move {
 				let directory = Arc::new(Directory::new(
 					[self.domain.clone()],
@@ -244,7 +282,11 @@ mod tests {
 	struct DownConnector;
 
 	impl Connector for DownConnector {
-		fn connect(&self, _domain: &str) -> ConnectFuture<'_> {
+		fn connect(
+			&self,
+			_domain: &str,
+			_policy: Option<&crate::mtasts::Policy>,
+		) -> ConnectFuture<'_> {
 			Box::pin(async { Err(DeliveryError::Transient("connection refused".into())) })
 		}
 	}
