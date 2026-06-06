@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-use crate::smtp::directory::Directory;
+use crate::directory_store::DirectoryHandle;
 use crate::smtp::line::{LineDecoder, LineError};
 
 use super::session::Session;
@@ -29,7 +29,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Connection for T {}
 pub struct Server {
 	hostname: String,
 	data_dir: PathBuf,
-	directory: Arc<Directory>,
+	directory: DirectoryHandle,
 	tls: TlsAcceptor,
 	tls_mode: TlsMode,
 }
@@ -40,7 +40,7 @@ impl Server {
 	pub fn new(
 		hostname: &str,
 		data_dir: PathBuf,
-		directory: Arc<Directory>,
+		directory: DirectoryHandle,
 		tls: TlsAcceptor,
 		tls_mode: TlsMode,
 	) -> Self {
@@ -81,7 +81,7 @@ impl Server {
 					Session::new(
 						&self.hostname,
 						self.data_dir.clone(),
-						Arc::clone(&self.directory),
+						self.directory.current(),
 					),
 				)
 			}
@@ -90,7 +90,7 @@ impl Server {
 				Session::new(
 					&self.hostname,
 					self.data_dir.clone(),
-					Arc::clone(&self.directory),
+					self.directory.current(),
 				)
 				.with_starttls(),
 			),
@@ -207,9 +207,9 @@ mod tests {
 	use tokio_rustls::rustls::pki_types::ServerName;
 	use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
-	fn directory() -> Arc<Directory> {
-		Arc::new(
-			Directory::new(
+	fn directory() -> DirectoryHandle {
+		DirectoryHandle::new(
+			crate::smtp::directory::Directory::new(
 				["example.org".to_string()],
 				[("alice@example.org".to_string(), "alice".to_string())],
 			)

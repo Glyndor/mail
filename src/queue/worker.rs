@@ -259,7 +259,7 @@ mod tests {
 			_policy: Option<&crate::mtasts::Policy>,
 		) -> ConnectFuture<'_> {
 			Box::pin(async move {
-				let directory = Arc::new(Directory::new(
+				let directory = crate::directory_store::DirectoryHandle::new(Directory::new(
 					[self.domain.clone()],
 					[(format!("bob@{}", self.domain), "bob".to_string())],
 				));

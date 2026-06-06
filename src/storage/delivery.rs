@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
+use crate::directory_store::DirectoryHandle;
 use crate::smtp::address::Address;
-use crate::smtp::directory::{Directory, Resolution};
+use crate::smtp::directory::Resolution;
 use crate::smtp::session::AcceptedMessage;
 use crate::smtp::sink::{MessageSink, SinkError};
 
@@ -19,14 +20,14 @@ use super::spool::write_sync;
 #[derive(Debug)]
 pub struct LocalDelivery {
 	accounts_root: PathBuf,
-	directory: Arc<Directory>,
+	directory: DirectoryHandle,
 }
 
 impl LocalDelivery {
 	/// Create a local delivery sink rooted at `data_dir`. Creates the
 	/// accounts directory eagerly so an unwritable data_dir fails at
 	/// startup, not on first delivery.
-	pub fn new(data_dir: &std::path::Path, directory: Arc<Directory>) -> std::io::Result<Self> {
+	pub fn new(data_dir: &std::path::Path, directory: DirectoryHandle) -> std::io::Result<Self> {
 		let accounts_root = data_dir.join("accounts");
 		fs::create_dir_all(&accounts_root)?;
 		Ok(LocalDelivery {
@@ -44,7 +45,7 @@ impl LocalDelivery {
 			let address = Address::parse(recipient).map_err(|_| {
 				SinkError::Unavailable(format!("unparseable recipient {recipient}"))
 			})?;
-			match self.directory.resolve(&address) {
+			match self.directory.current().resolve(&address) {
 				Resolution::Account(account) => {
 					accounts.insert(account);
 				}
@@ -91,8 +92,8 @@ impl MessageSink for LocalDelivery {
 mod tests {
 	use super::*;
 
-	fn directory() -> Arc<Directory> {
-		Arc::new(Directory::new(
+	fn directory() -> DirectoryHandle {
+		DirectoryHandle::new(crate::smtp::directory::Directory::new(
 			["example.org".to_string()],
 			[
 				("alice@example.org".to_string(), "alice".to_string()),

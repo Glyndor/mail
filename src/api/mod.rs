@@ -52,10 +52,18 @@ mod tests {
 			addresses: vec!["alice@example.org".to_string()],
 			password_hash: Some("$argon2id$secret".to_string()),
 		}];
+		let store = std::sync::Arc::new(
+			crate::directory_store::AccountStore::open(
+				dir,
+				vec!["example.org".to_string()],
+				accounts,
+			)
+			.expect("open store"),
+		);
 		ApiState::new(
 			&crate::smtp::auth::tests::hash(TOKEN),
 			vec!["example.org".to_string()],
-			&accounts,
+			store,
 			spool,
 		)
 	}
@@ -66,13 +74,30 @@ mod tests {
 		path: &str,
 		token: Option<&str>,
 	) -> (StatusCode, serde_json::Value) {
+		request_with_body(app, method, path, token, None).await
+	}
+
+	async fn request_with_body(
+		app: &Router,
+		method: &str,
+		path: &str,
+		token: Option<&str>,
+		body: Option<serde_json::Value>,
+	) -> (StatusCode, serde_json::Value) {
 		let mut builder = Request::builder().method(method).uri(path);
 		if let Some(token) = token {
 			builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
 		}
+		let body = match body {
+			Some(json) => {
+				builder = builder.header(header::CONTENT_TYPE, "application/json");
+				Body::from(json.to_string())
+			}
+			None => Body::empty(),
+		};
 		let response = app
 			.clone()
-			.oneshot(builder.body(Body::empty()).expect("request"))
+			.oneshot(builder.body(body).expect("request"))
 			.await
 			.expect("response");
 		let status = response.status();
@@ -187,6 +212,98 @@ mod tests {
 			request(&app, "DELETE", &format!("/api/v1/queue/{id}"), Some(TOKEN)).await;
 		assert_eq!(status, StatusCode::NOT_FOUND);
 		assert_eq!(body["error"]["code"], "not_found");
+	}
+
+	#[tokio::test]
+	async fn account_create_delete_and_password_flow() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let app = router(test_state(dir.path(), 0));
+
+		let (status, body) = request_with_body(
+			&app,
+			"POST",
+			"/api/v1/accounts",
+			Some(TOKEN),
+			Some(serde_json::json!({
+				"name": "bob",
+				"addresses": ["bob@example.org"],
+				"password": "a-long-password"
+			})),
+		)
+		.await;
+		assert_eq!(status, StatusCode::OK, "{body}");
+		assert_eq!(body["created"], "bob");
+
+		let (_, body) = request(&app, "GET", "/api/v1/accounts", Some(TOKEN)).await;
+		let names: Vec<&str> = body["accounts"]
+			.as_array()
+			.expect("accounts")
+			.iter()
+			.map(|account| account["name"].as_str().expect("name"))
+			.collect();
+		assert!(names.contains(&"bob"), "{body}");
+
+		let (status, _) = request_with_body(
+			&app,
+			"PUT",
+			"/api/v1/accounts/bob/password",
+			Some(TOKEN),
+			Some(serde_json::json!({"password": "another-long-password"})),
+		)
+		.await;
+		assert_eq!(status, StatusCode::OK);
+
+		let (status, body) = request(&app, "DELETE", "/api/v1/accounts/bob", Some(TOKEN)).await;
+		assert_eq!(status, StatusCode::OK, "{body}");
+
+		// Static accounts cannot be deleted.
+		let (status, _) = request(&app, "DELETE", "/api/v1/accounts/alice", Some(TOKEN)).await;
+		assert_eq!(status, StatusCode::NOT_FOUND);
+	}
+
+	#[tokio::test]
+	async fn account_creation_validates_input() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let app = router(test_state(dir.path(), 0));
+
+		// Short password.
+		let (status, _) = request_with_body(
+			&app,
+			"POST",
+			"/api/v1/accounts",
+			Some(TOKEN),
+			Some(serde_json::json!({
+				"name": "bob", "addresses": ["bob@example.org"], "password": "short"
+			})),
+		)
+		.await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+
+		// Foreign domain.
+		let (status, _) = request_with_body(
+			&app,
+			"POST",
+			"/api/v1/accounts",
+			Some(TOKEN),
+			Some(serde_json::json!({
+				"name": "bob", "addresses": ["bob@elsewhere.example"], "password": "a-long-password"
+			})),
+		)
+		.await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+
+		// Duplicate static name.
+		let (status, _) = request_with_body(
+			&app,
+			"POST",
+			"/api/v1/accounts",
+			Some(TOKEN),
+			Some(serde_json::json!({
+				"name": "alice", "addresses": ["alice2@example.org"], "password": "a-long-password"
+			})),
+		)
+		.await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
 	}
 
 	#[tokio::test]

@@ -48,6 +48,22 @@ pub fn parse_plain(encoded: &str) -> Result<PlainCredentials, PlainError> {
 	})
 }
 
+/// Hash a password with argon2id for storage (PHC string).
+pub fn hash_password(password: &str) -> Result<String, String> {
+	use argon2::password_hash::{PasswordHasher, SaltString};
+	use ring::rand::{SecureRandom, SystemRandom};
+
+	let mut salt_bytes = [0u8; 16];
+	SystemRandom::new()
+		.fill(&mut salt_bytes)
+		.map_err(|_| "cannot gather salt entropy".to_string())?;
+	let salt = SaltString::encode_b64(&salt_bytes).map_err(|error| error.to_string())?;
+	Argon2::default()
+		.hash_password(password.as_bytes(), &salt)
+		.map(|hash| hash.to_string())
+		.map_err(|error| error.to_string())
+}
+
 /// Verify a password against an argon2id PHC hash. Any malformed hash or
 /// mismatch is a plain `false`: callers must not learn why.
 pub fn verify_password(phc_hash: &str, password: &str) -> bool {
@@ -124,6 +140,14 @@ pub(crate) mod tests {
 			parse_plain(&encode("", "alice", "")),
 			Err(PlainError::BadFormat)
 		);
+	}
+
+	#[test]
+	fn runtime_hash_roundtrips() {
+		let hash = hash_password("hunter2").expect("hashes");
+		assert!(hash.starts_with("$argon2id$"));
+		assert!(verify_password(&hash, "hunter2"));
+		assert!(!verify_password(&hash, "hunter3"));
 	}
 
 	#[test]
