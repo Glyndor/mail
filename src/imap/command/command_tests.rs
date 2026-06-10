@@ -224,3 +224,37 @@ fn parses_imap_date() {
 	assert_eq!(super::parse_imap_date("1-Bad-2024"), None);
 	assert_eq!(super::parse_imap_date("0-Jan-2024"), None);
 }
+
+#[test]
+fn search_with_no_criteria_is_bad_arguments() {
+	assert!(matches!(parse("t1 SEARCH"), Err(ParseError::BadArguments(_))));
+}
+
+#[test]
+fn parses_search_on_date_criterion() {
+	let cmd = parse("a1 SEARCH ON 1-Jan-2024").expect("parses");
+	assert!(
+		matches!(
+			cmd.command,
+			Command::Search { ref criteria, .. }
+			if matches!(criteria[0], SearchKey::On(2024, 1, 1))
+		),
+		"{:?}",
+		cmd.command
+	);
+}
+
+#[test]
+fn sequence_set_reversed_range_is_normalized() {
+	let set = super::parse_sequence_set("5:2").expect("parse");
+	// start > end → still matches values within [2, 5]
+	assert!(set.contains(2, 10));
+	assert!(set.contains(5, 10));
+	assert!(set.contains(3, 10));
+	assert!(!set.contains(6, 10));
+}
+
+#[test]
+fn parse_sequence_set_empty_input_returns_none() {
+	assert_eq!(super::parse_sequence_set(""), None);
+}
