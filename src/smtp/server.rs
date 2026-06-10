@@ -277,26 +277,34 @@ impl Server {
 									_ => {}
 								}
 
-								let mut results = format!(
-									"Authentication-Results: {}; spf={}",
-									self.hostname,
-									outcome.as_str()
-								);
+								let mut methods: Vec<String> = Vec::new();
+
+								let mut spf_result = format!("spf={}", outcome.as_str());
 								if let Some(domain) = &domain {
-									results.push_str(&format!(" smtp.mailfrom={domain}"));
+									spf_result.push_str(&format!(" smtp.mailfrom={domain}"));
 								}
-								for dkim in &dkim_results {
-									results.push_str(&format!("; dkim={}", dkim.outcome.as_str()));
-									if let Some(d) = &dkim.domain {
-										results.push_str(&format!(" header.d={d}"));
+								methods.push(spf_result);
+
+								if dkim_results.is_empty() {
+									methods.push("dkim=none".to_string());
+								} else {
+									for dkim in &dkim_results {
+										let mut entry = format!("dkim={}", dkim.outcome.as_str());
+										if let Some(d) = &dkim.domain {
+											entry.push_str(&format!(" header.d={d}"));
+										}
+										methods.push(entry);
 									}
 								}
-								results.push_str(&format!("; dmarc={}", dmarc.as_str()));
+
+								let mut dmarc_result = format!("dmarc={}", dmarc.as_str());
 								if let Some(from) = &from {
-									results.push_str(&format!(" header.from={from}"));
+									dmarc_result.push_str(&format!(" header.from={from}"));
 								}
-								results.push_str("\r\n");
-								auth_headers.push_str(&results);
+								methods.push(dmarc_result);
+
+								auth_headers
+									.push_str(&format_auth_results(&self.hostname, &methods));
 							}
 						}
 					}
@@ -375,6 +383,18 @@ fn received_header(
 		"Received: from {client} ({peer})\r\n\tby {hostname} with {protocol};\r\n\t{}\r\n",
 		crate::clock::rfc5322(now)
 	)
+}
+
+/// Build a folded `Authentication-Results` header (RFC 8601 §2.2).
+/// Each method result is placed on a separate folded continuation line.
+fn format_auth_results(hostname: &str, methods: &[String]) -> String {
+	let mut out = format!("Authentication-Results: {hostname}");
+	for method in methods {
+		out.push_str(";\r\n\t");
+		out.push_str(method);
+	}
+	out.push_str("\r\n");
+	out
 }
 
 fn line_error_reply(error: &LineError) -> Reply {
@@ -614,7 +634,7 @@ QUIT\r\n";
 		let data = String::from_utf8(sink.messages()[0].data.clone()).expect("ascii");
 		assert!(
 			data.contains(
-				"Authentication-Results: mail.example.org; spf=pass smtp.mailfrom=sender.example; dkim=none"
+				"Authentication-Results: mail.example.org;\r\n\tspf=pass smtp.mailfrom=sender.example;\r\n\tdkim=none;\r\n\tdmarc="
 			),
 			"{data}"
 		);
