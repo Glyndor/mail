@@ -72,6 +72,30 @@ pub enum Command {
 		criteria: Vec<SearchKey>,
 		uid: bool,
 	},
+	Status {
+		mailbox: String,
+		items: Vec<StatusItem>,
+	},
+	Subscribe {
+		mailbox: String,
+	},
+	Unsubscribe {
+		mailbox: String,
+	},
+	Lsub {
+		reference: String,
+		pattern: String,
+	},
+}
+
+/// Items that can be requested in a STATUS command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusItem {
+	Messages,
+	Recent,
+	Uidnext,
+	Uidvalidity,
+	Unseen,
 }
 
 /// A single SEARCH criterion; multiple keys AND together.
@@ -205,6 +229,23 @@ pub fn parse(line: &str) -> Result<Tagged, ParseError> {
 		"COPY" => parse_copy(&tag, args, false, false)?,
 		"MOVE" => parse_copy(&tag, args, false, true)?,
 		"SEARCH" => parse_search(&tag, args, false)?,
+		"STATUS" => parse_status(&tag, args)?,
+		"SUBSCRIBE" => Command::Subscribe {
+			mailbox: parse_mailbox(&tag, args)?,
+		},
+		"UNSUBSCRIBE" => Command::Unsubscribe {
+			mailbox: parse_mailbox(&tag, args)?,
+		},
+		"LSUB" => {
+			let (reference, rest) = parse_astring(args)
+				.ok_or_else(|| ParseError::BadArguments(tag.clone()))?;
+			let (pattern, rest) = parse_astring(rest)
+				.ok_or_else(|| ParseError::BadArguments(tag.clone()))?;
+			if !rest.trim().is_empty() {
+				return Err(ParseError::BadArguments(tag));
+			}
+			Command::Lsub { reference, pattern }
+		}
 		"UID" => {
 			let (sub, sub_args) = args
 				.split_once(' ')
@@ -519,6 +560,35 @@ fn parse_sequence_set(text: &str) -> Option<SequenceSet> {
 		return None;
 	}
 	Some(SequenceSet { ranges })
+}
+
+fn parse_status(tag: &str, args: &str) -> Result<Command, ParseError> {
+	let bad = || ParseError::BadArguments(tag.to_string());
+	let (mailbox, rest) = parse_astring(args).ok_or_else(bad)?;
+	if mailbox.is_empty() {
+		return Err(bad());
+	}
+	let rest = rest.trim();
+	let inner = rest
+		.strip_prefix('(')
+		.and_then(|t| t.strip_suffix(')'))
+		.ok_or_else(bad)?;
+	let mut items = Vec::new();
+	for word in inner.split_whitespace() {
+		let item = match word.to_ascii_uppercase().as_str() {
+			"MESSAGES" => StatusItem::Messages,
+			"RECENT" => StatusItem::Recent,
+			"UIDNEXT" => StatusItem::Uidnext,
+			"UIDVALIDITY" => StatusItem::Uidvalidity,
+			"UNSEEN" => StatusItem::Unseen,
+			_ => return Err(bad()),
+		};
+		items.push(item);
+	}
+	if items.is_empty() {
+		return Err(bad());
+	}
+	Ok(Command::Status { mailbox, items })
 }
 
 fn parse_seq_number(text: &str) -> Option<u32> {
