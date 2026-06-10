@@ -46,8 +46,7 @@ fn authenticated_session() -> Session {
 
 // Unauthenticated session with no TLS — used for relay/sender tests.
 fn greeted_plain() -> Session {
-	let mut session = Session::new("mail.example.org")
-		.with_directory(auth_directory());
+	let mut session = Session::new("mail.example.org").with_directory(auth_directory());
 	session.command_line("EHLO client.example.org");
 	session
 }
