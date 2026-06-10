@@ -23,6 +23,8 @@ pub struct Record {
 	pub subdomain_policy: Policy,
 	pub dkim_alignment: Alignment,
 	pub spf_alignment: Alignment,
+	/// Percentage of messages subject to the policy (0–100, default 100).
+	pub pct: u8,
 }
 
 /// Parse a `v=DMARC1` TXT record. Returns `None` for records that are not
@@ -37,6 +39,7 @@ pub fn parse(text: &str) -> Option<Result<Record, ()>> {
 	let mut subdomain_policy = None;
 	let mut dkim_alignment = Alignment::Relaxed;
 	let mut spf_alignment = Alignment::Relaxed;
+	let mut pct: u8 = 100;
 
 	for tag in tags {
 		if tag.is_empty() {
@@ -63,7 +66,10 @@ pub fn parse(text: &str) -> Option<Result<Record, ()>> {
 				Some(parsed) => spf_alignment = parsed,
 				None => return Some(Err(())),
 			},
-			// rua/ruf/pct/fo/rf/ri and unknown tags are ignored for now.
+			"pct" => match value.parse::<u8>() {
+				Ok(v) => pct = v.min(100),
+				Err(_) => return Some(Err(())),
+			},
 			_ => {}
 		}
 	}
@@ -77,6 +83,7 @@ pub fn parse(text: &str) -> Option<Result<Record, ()>> {
 		subdomain_policy: subdomain_policy.unwrap_or(policy),
 		dkim_alignment,
 		spf_alignment,
+		pct,
 	}))
 }
 
@@ -122,11 +129,41 @@ mod tests {
 	}
 
 	#[test]
-	fn ignores_reporting_tags() {
+	fn parses_pct_and_ignores_reporting_tags() {
 		let record = parse("v=DMARC1; p=quarantine; rua=mailto:agg@example.org; pct=50")
 			.expect("is dmarc")
 			.expect("valid");
 		assert_eq!(record.policy, Policy::Quarantine);
+		assert_eq!(record.pct, 50);
+	}
+
+	#[test]
+	fn pct_defaults_to_100() {
+		let record = parse("v=DMARC1; p=reject")
+			.expect("is dmarc")
+			.expect("valid");
+		assert_eq!(record.pct, 100);
+	}
+
+	#[test]
+	fn pct_clamped_to_100() {
+		let record = parse("v=DMARC1; p=reject; pct=200")
+			.expect("is dmarc")
+			.expect("valid");
+		assert_eq!(record.pct, 100);
+	}
+
+	#[test]
+	fn pct_zero_parsed() {
+		let record = parse("v=DMARC1; p=reject; pct=0")
+			.expect("is dmarc")
+			.expect("valid");
+		assert_eq!(record.pct, 0);
+	}
+
+	#[test]
+	fn pct_non_numeric_is_error() {
+		assert_eq!(parse("v=DMARC1; p=reject; pct=all"), Some(Err(())));
 	}
 
 	#[test]

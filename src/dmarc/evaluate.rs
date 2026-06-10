@@ -100,6 +100,28 @@ pub async fn evaluate(
 	spf: (SpfOutcome, Option<&str>),
 	dkim: &[DkimResult],
 ) -> DmarcOutcome {
+	evaluate_inner(dns, from_domain, spf, dkim, sample_pct()).await
+}
+
+/// Draws a random number in [1, 100] for pct= sampling.
+fn sample_pct() -> u8 {
+	use ring::rand::{SecureRandom, SystemRandom};
+	let rng = SystemRandom::new();
+	let mut buf = [0u8; 1];
+	// Ignore fill errors — on failure the result is 0, which causes
+	// non-sampled treatment (safe: slightly over-permissive, not under).
+	let _ = rng.fill(&mut buf);
+	(buf[0] % 100) + 1
+}
+
+/// Testable inner evaluator that accepts an explicit pct roll (1–100).
+async fn evaluate_inner(
+	dns: &dyn DnsLookup,
+	from_domain: &str,
+	spf: (SpfOutcome, Option<&str>),
+	dkim: &[DkimResult],
+	pct_roll: u8,
+) -> DmarcOutcome {
 	let (record, applied_policy) = match fetch_record(dns, from_domain).await {
 		Ok(Some(found)) => found,
 		Ok(None) => return DmarcOutcome::None,
@@ -123,7 +145,15 @@ pub async fn evaluate(
 	}
 	match applied_policy {
 		Policy::None => DmarcOutcome::Fail,
-		Policy::Quarantine | Policy::Reject => DmarcOutcome::Reject,
+		// RFC 7489 §6.6.2: apply policy only to pct% of failing messages;
+		// non-sampled messages are treated as if policy were "none".
+		Policy::Quarantine | Policy::Reject => {
+			if record.pct < 100 && pct_roll > record.pct {
+				DmarcOutcome::Fail
+			} else {
+				DmarcOutcome::Reject
+			}
+		}
 	}
 }
 
@@ -378,5 +408,60 @@ mod tests {
 		dns.fail = true;
 		let outcome = evaluate(&dns, "example.org", (SpfOutcome::Fail, None), &[]).await;
 		assert_eq!(outcome, DmarcOutcome::TempError);
+	}
+
+	#[tokio::test]
+	async fn pct_100_always_enforces() {
+		let dns = dns(&[("_dmarc.example.org", "v=DMARC1; p=reject; pct=100")]);
+		// roll=100 ≤ pct=100 → sampled → enforce
+		let outcome = evaluate_inner(&dns, "example.org", (SpfOutcome::Fail, None), &[], 100).await;
+		assert_eq!(outcome, DmarcOutcome::Reject);
+		// roll=1 ≤ pct=100 → sampled → enforce
+		let outcome = evaluate_inner(&dns, "example.org", (SpfOutcome::Fail, None), &[], 1).await;
+		assert_eq!(outcome, DmarcOutcome::Reject);
+	}
+
+	#[tokio::test]
+	async fn pct_0_never_enforces() {
+		// pct=0 means 0% sampled: every roll > 0 → not sampled → Fail
+		let dns = dns(&[("_dmarc.example.org", "v=DMARC1; p=reject; pct=0")]);
+		let outcome = evaluate_inner(&dns, "example.org", (SpfOutcome::Fail, None), &[], 1).await;
+		assert_eq!(outcome, DmarcOutcome::Fail);
+		let outcome = evaluate_inner(&dns, "example.org", (SpfOutcome::Fail, None), &[], 100).await;
+		assert_eq!(outcome, DmarcOutcome::Fail);
+	}
+
+	#[tokio::test]
+	async fn pct_50_boundary() {
+		let dns = dns(&[("_dmarc.example.org", "v=DMARC1; p=reject; pct=50")]);
+		// roll=50 ≤ pct=50 → sampled → Reject
+		let outcome = evaluate_inner(&dns, "example.org", (SpfOutcome::Fail, None), &[], 50).await;
+		assert_eq!(outcome, DmarcOutcome::Reject);
+		// roll=51 > pct=50 → not sampled → Fail
+		let outcome = evaluate_inner(&dns, "example.org", (SpfOutcome::Fail, None), &[], 51).await;
+		assert_eq!(outcome, DmarcOutcome::Fail);
+	}
+
+	#[tokio::test]
+	async fn pct_sampling_does_not_affect_passing_messages() {
+		// Even pct=0, aligned messages still pass.
+		let dns = dns(&[("_dmarc.example.org", "v=DMARC1; p=reject; pct=0")]);
+		let outcome = evaluate_inner(
+			&dns,
+			"example.org",
+			(SpfOutcome::Fail, None),
+			&dkim_pass("example.org"),
+			1,
+		)
+		.await;
+		assert_eq!(outcome, DmarcOutcome::Pass);
+	}
+
+	#[tokio::test]
+	async fn pct_sampling_does_not_affect_policy_none() {
+		// pct has no meaning when policy=none (already Fail regardless).
+		let dns = dns(&[("_dmarc.example.org", "v=DMARC1; p=none; pct=0")]);
+		let outcome = evaluate_inner(&dns, "example.org", (SpfOutcome::Fail, None), &[], 1).await;
+		assert_eq!(outcome, DmarcOutcome::Fail);
 	}
 }
