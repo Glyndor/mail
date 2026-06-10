@@ -208,10 +208,16 @@ fn aligned(mode: Alignment, identifier: &str, from_domain: &str) -> bool {
 	}
 }
 
-/// Approximate the organizational domain as the registrable suffix of two
-/// labels. A public-suffix list would be exact; this heuristic is recorded
-/// as a limitation in #15 (it is wrong for e.g. `co.uk` registrations).
+/// Return the organizational (registrable) domain using the Mozilla PSL.
+/// Falls back to the rightmost two labels when the PSL returns no result.
 fn organizational_domain(domain: &str) -> String {
+	use psl::Psl;
+	if let Some(d) = psl::List.domain(domain.as_bytes())
+		&& let Ok(s) = std::str::from_utf8(d.as_bytes())
+	{
+		return s.to_ascii_lowercase();
+	}
+	// Fallback: two-label heuristic (covers plain TLDs like .com, .org).
 	let labels: Vec<&str> = domain.split('.').collect();
 	if labels.len() <= 2 {
 		return domain.to_string();
@@ -413,17 +419,14 @@ mod tests {
 	#[tokio::test]
 	async fn pct_100_always_enforces() {
 		let dns = dns(&[("_dmarc.example.org", "v=DMARC1; p=reject; pct=100")]);
-		// roll=100 ≤ pct=100 → sampled → enforce
 		let outcome = evaluate_inner(&dns, "example.org", (SpfOutcome::Fail, None), &[], 100).await;
 		assert_eq!(outcome, DmarcOutcome::Reject);
-		// roll=1 ≤ pct=100 → sampled → enforce
 		let outcome = evaluate_inner(&dns, "example.org", (SpfOutcome::Fail, None), &[], 1).await;
 		assert_eq!(outcome, DmarcOutcome::Reject);
 	}
 
 	#[tokio::test]
 	async fn pct_0_never_enforces() {
-		// pct=0 means 0% sampled: every roll > 0 → not sampled → Fail
 		let dns = dns(&[("_dmarc.example.org", "v=DMARC1; p=reject; pct=0")]);
 		let outcome = evaluate_inner(&dns, "example.org", (SpfOutcome::Fail, None), &[], 1).await;
 		assert_eq!(outcome, DmarcOutcome::Fail);
@@ -434,17 +437,14 @@ mod tests {
 	#[tokio::test]
 	async fn pct_50_boundary() {
 		let dns = dns(&[("_dmarc.example.org", "v=DMARC1; p=reject; pct=50")]);
-		// roll=50 ≤ pct=50 → sampled → Reject
 		let outcome = evaluate_inner(&dns, "example.org", (SpfOutcome::Fail, None), &[], 50).await;
 		assert_eq!(outcome, DmarcOutcome::Reject);
-		// roll=51 > pct=50 → not sampled → Fail
 		let outcome = evaluate_inner(&dns, "example.org", (SpfOutcome::Fail, None), &[], 51).await;
 		assert_eq!(outcome, DmarcOutcome::Fail);
 	}
 
 	#[tokio::test]
 	async fn pct_sampling_does_not_affect_passing_messages() {
-		// Even pct=0, aligned messages still pass.
 		let dns = dns(&[("_dmarc.example.org", "v=DMARC1; p=reject; pct=0")]);
 		let outcome = evaluate_inner(
 			&dns,
@@ -459,9 +459,47 @@ mod tests {
 
 	#[tokio::test]
 	async fn pct_sampling_does_not_affect_policy_none() {
-		// pct has no meaning when policy=none (already Fail regardless).
 		let dns = dns(&[("_dmarc.example.org", "v=DMARC1; p=none; pct=0")]);
 		let outcome = evaluate_inner(&dns, "example.org", (SpfOutcome::Fail, None), &[], 1).await;
 		assert_eq!(outcome, DmarcOutcome::Fail);
+	}
+
+	// PSL-based organizational domain tests
+
+	#[test]
+	fn psl_two_part_tld_is_handled() {
+		assert_eq!(organizational_domain("news.example.co.uk"), "example.co.uk");
+		assert_eq!(organizational_domain("mail.example.co.uk"), "example.co.uk");
+	}
+
+	#[test]
+	fn psl_plain_tld_unchanged() {
+		assert_eq!(organizational_domain("example.com"), "example.com");
+		assert_eq!(organizational_domain("sub.example.org"), "example.org");
+	}
+
+	#[test]
+	fn psl_different_co_uk_domains_do_not_align() {
+		let a = organizational_domain("victim.co.uk");
+		let b = organizational_domain("attacker.co.uk");
+		assert_ne!(
+			a, b,
+			"distinct co.uk registrations must not share org domain"
+		);
+		assert_eq!(a, "victim.co.uk");
+		assert_eq!(b, "attacker.co.uk");
+	}
+
+	#[tokio::test]
+	async fn relaxed_alignment_uses_psl_for_co_uk() {
+		let dns = dns(&[("_dmarc.example.co.uk", "v=DMARC1; p=reject")]);
+		let outcome = evaluate(
+			&dns,
+			"example.co.uk",
+			(SpfOutcome::Fail, None),
+			&dkim_pass("news.example.co.uk"),
+		)
+		.await;
+		assert_eq!(outcome, DmarcOutcome::Pass);
 	}
 }
