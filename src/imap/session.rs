@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::smtp::directory::Directory;
 
-use super::command::{Command, FetchItem, ParseError, SearchKey, StoreMode, Tagged};
+use super::command::{Command, FetchItem, ParseError, SearchKey, StatusItem, StoreMode, Tagged};
 use super::mailbox::{self, Flag, Snapshot, render_flags};
 
 /// Server output produced by one step: zero or more complete response
@@ -211,6 +211,14 @@ impl Session {
 				remove_source,
 			} => self.copy(&tag, &sequence, &mailbox, uid, remove_source),
 			Command::Search { criteria, uid } => self.search(&tag, &criteria, uid),
+			Command::Status { mailbox, items } => self.status(&tag, &mailbox, &items),
+			Command::Subscribe { mailbox } => self.subscription_op(&tag, |data_dir, account| {
+				mailbox::subscribe(data_dir, account, &mailbox)
+			}),
+			Command::Unsubscribe { mailbox } => self.subscription_op(&tag, |data_dir, account| {
+				mailbox::unsubscribe(data_dir, account, &mailbox)
+			}),
+			Command::Lsub { pattern, .. } => self.lsub(&tag, &pattern),
 		}
 	}
 
@@ -593,6 +601,75 @@ impl Session {
 		}
 	}
 
+	fn status(&mut self, tag: &str, mailbox: &str, items: &[StatusItem]) -> Output {
+		let Some(account) = self.account().map(str::to_string) else {
+			return Output::text(format!("{tag} NO not authenticated\r\n"));
+		};
+		if !mailbox::exists(&self.data_dir, &account, mailbox) {
+			return Output::text(format!("{tag} NO no such mailbox\r\n"));
+		}
+		let snapshot = match Snapshot::open(&self.data_dir, &account, mailbox) {
+			Ok(s) => s,
+			Err(_) => return Output::text(format!("{tag} NO cannot open mailbox\r\n")),
+		};
+		let mut parts = String::new();
+		for (i, item) in items.iter().enumerate() {
+			if i > 0 {
+				parts.push(' ');
+			}
+			let value: u32 = match item {
+				StatusItem::Messages => snapshot.len() as u32,
+				StatusItem::Recent => 0,
+				StatusItem::Uidnext => snapshot.uid_next(),
+				StatusItem::Uidvalidity => snapshot.uid_validity(),
+				StatusItem::Unseen => snapshot
+					.messages()
+					.filter(|m| !m.flags.contains(&Flag::Seen))
+					.count() as u32,
+			};
+			let name = match item {
+				StatusItem::Messages => "MESSAGES",
+				StatusItem::Recent => "RECENT",
+				StatusItem::Uidnext => "UIDNEXT",
+				StatusItem::Uidvalidity => "UIDVALIDITY",
+				StatusItem::Unseen => "UNSEEN",
+			};
+			parts.push_str(&format!("{name} {value}"));
+		}
+		Output::text(format!(
+			"* STATUS \"{mailbox}\" ({parts})\r\n{tag} OK STATUS completed\r\n"
+		))
+	}
+
+	fn lsub(&mut self, tag: &str, pattern: &str) -> Output {
+		let Some(account) = self.account().map(str::to_string) else {
+			return Output::text(format!("{tag} NO not authenticated\r\n"));
+		};
+		let mut response = String::new();
+		for name in mailbox::list_subscribed(&self.data_dir, &account) {
+			let matches = pattern == "*" || pattern == "%" || pattern.eq_ignore_ascii_case(&name);
+			if matches {
+				response.push_str(&format!("* LSUB () \"/\" \"{name}\"\r\n"));
+			}
+		}
+		response.push_str(&format!("{tag} OK LSUB completed\r\n"));
+		Output::text(response)
+	}
+
+	fn subscription_op(
+		&mut self,
+		tag: &str,
+		operation: impl FnOnce(&std::path::Path, &str) -> std::io::Result<()>,
+	) -> Output {
+		let Some(account) = self.account().map(str::to_string) else {
+			return Output::text(format!("{tag} NO not authenticated\r\n"));
+		};
+		match operation(&self.data_dir, &account) {
+			Ok(()) => Output::text(format!("{tag} OK completed\r\n")),
+			Err(error) => Output::text(format!("{tag} NO {error}\r\n")),
+		}
+	}
+
 	fn fetch(
 		&mut self,
 		tag: &str,
@@ -628,8 +705,8 @@ impl Session {
 						parts.push(format!("RFC822.SIZE {}", message.size).into_bytes());
 					}
 					FetchItem::InternalDate => {
-						// Snapshot has no per-message date metadata yet.
-						parts.push(b"INTERNALDATE \"01-Jan-1970 00:00:00 +0000\"".to_vec());
+						let dt = format_internaldate(message.internal_date);
+						parts.push(format!("INTERNALDATE \"{dt}\"").into_bytes());
 					}
 					FetchItem::Body => match snapshot.read(message) {
 						Ok(data) => {
@@ -662,6 +739,43 @@ impl Session {
 			upgrade_tls: false,
 		}
 	}
+}
+
+/// Format a SystemTime as an IMAP INTERNALDATE string (RFC 3501).
+fn format_internaldate(t: std::time::SystemTime) -> String {
+	const MONTHS: [&str; 12] = [
+		"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+	];
+	let secs = t
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_secs();
+	let (year, month, day) = epoch_to_ymd(secs / 86400);
+	let hms = secs % 86400;
+	format!(
+		"{:2}-{}-{:04} {:02}:{:02}:{:02} +0000",
+		day,
+		MONTHS[month as usize - 1],
+		year,
+		hms / 3600,
+		(hms % 3600) / 60,
+		hms % 60
+	)
+}
+
+/// Proleptic Gregorian calendar: days since Unix epoch → (year, month 1-12, day 1-31).
+fn epoch_to_ymd(days: u64) -> (u64, u64, u64) {
+	let z = days + 719_468;
+	let era = z / 146_097;
+	let doe = z % 146_097;
+	let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+	let y = yoe + era * 400;
+	let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	let mp = (5 * doy + 2) / 153;
+	let d = doy - (153 * mp + 2) / 5 + 1;
+	let m = if mp < 10 { mp + 3 } else { mp - 9 };
+	let y = if m <= 2 { y + 1 } else { y };
+	(y, m, d)
 }
 
 /// Extract a header value (lowercased input) from a lowercased message,
@@ -1236,5 +1350,98 @@ mod tests {
 		let mut session = logged_in(dir.path());
 		let output = session.command_line("a2 SELECT Archive");
 		assert!(text(&output).contains("a2 NO"));
+	}
+
+	#[test]
+	fn status_reports_counts_for_inbox() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		deliver(dir.path(), b"one\r\n");
+		deliver(dir.path(), b"two\r\n");
+		let mut session = logged_in(dir.path());
+
+		let response = text(
+			&session.command_line("a2 STATUS INBOX (MESSAGES UIDNEXT UIDVALIDITY UNSEEN RECENT)"),
+		);
+		assert!(response.contains("MESSAGES 2"), "{response}");
+		assert!(response.contains("UNSEEN 2"), "{response}");
+		assert!(response.contains("RECENT 0"), "{response}");
+		assert!(response.contains("a2 OK STATUS completed"), "{response}");
+
+		// Mark one seen; UNSEEN should drop to 1.
+		session.command_line("a3 SELECT INBOX");
+		session.command_line(r"a4 STORE 1 +FLAGS (\Seen)");
+		session.command_line("a5 CLOSE");
+		let response = text(&session.command_line("a6 STATUS INBOX (MESSAGES UNSEEN)"));
+		assert!(response.contains("MESSAGES 2"), "{response}");
+		assert!(response.contains("UNSEEN 1"), "{response}");
+	}
+
+	#[test]
+	fn status_requires_authentication_and_existing_mailbox() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let mut session = Session::new("mail.example.org", dir.path().to_path_buf(), directory());
+		let output = session.command_line("a1 STATUS INBOX (MESSAGES)");
+		assert!(text(&output).contains("a1 NO"), "{}", text(&output));
+
+		let mut session = logged_in(dir.path());
+		let output = session.command_line("a2 STATUS Archive (MESSAGES)");
+		assert!(text(&output).contains("a2 NO"), "{}", text(&output));
+	}
+
+	#[test]
+	fn subscribe_and_lsub_flow() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let mut session = logged_in(dir.path());
+		session.command_line("a2 CREATE Sent");
+
+		// INBOX always present in LSUB even without explicit SUBSCRIBE.
+		let response = text(&session.command_line(r#"a3 LSUB "" "*""#));
+		assert!(response.contains("\"INBOX\""), "{response}");
+		assert!(response.contains("a3 OK LSUB completed"), "{response}");
+
+		// Subscribe Sent; it must appear.
+		let output = session.command_line("a4 SUBSCRIBE Sent");
+		assert!(text(&output).contains("a4 OK"), "{}", text(&output));
+		let response = text(&session.command_line(r#"a5 LSUB "" "*""#));
+		assert!(response.contains("\"Sent\""), "{response}");
+
+		// Unsubscribe Sent; it disappears.
+		session.command_line("a6 UNSUBSCRIBE Sent");
+		let response = text(&session.command_line(r#"a7 LSUB "" "*""#));
+		assert!(!response.contains("\"Sent\""), "{response}");
+		assert!(response.contains("\"INBOX\""), "{response}");
+	}
+
+	#[test]
+	fn internaldate_is_not_epoch() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		deliver(dir.path(), b"From: a@x.example\r\n\r\nhi\r\n");
+		let mut session = logged_in(dir.path());
+		session.command_line("a2 SELECT INBOX");
+		let response = text(&session.command_line("a3 FETCH 1 (INTERNALDATE)"));
+		// Must not be the epoch placeholder.
+		assert!(!response.contains("01-Jan-1970"), "{response}");
+		assert!(response.contains("INTERNALDATE"), "{response}");
+		assert!(response.contains("a3 OK FETCH completed"), "{response}");
+	}
+
+	#[test]
+	fn internaldate_format_sanity() {
+		// 2024-06-09 12:34:56 UTC = 1717936496 seconds since epoch.
+		let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_717_936_496);
+		assert_eq!(format_internaldate(t), " 9-Jun-2024 12:34:56 +0000");
+		// Epoch itself.
+		assert_eq!(
+			format_internaldate(std::time::UNIX_EPOCH),
+			" 1-Jan-1970 00:00:00 +0000"
+		);
+		// A date with a two-digit day (no space padding).
+		let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_718_000_000);
+		let s = format_internaldate(t);
+		// 2024-06-10 in UTC; day >= 10 so no leading space.
+		assert!(
+			!s.starts_with(' '),
+			"expected no leading space for day >= 10: {s}"
+		);
 	}
 }
