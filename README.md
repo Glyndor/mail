@@ -34,7 +34,15 @@ flowchart LR
 - 💾 **Crash-safe writes** — accepted messages are fsynced and atomically renamed into the mailbox before the server answers `250`
 - 🧰 **Operator CLI** — `mail serve`, `mail config-check`, `mail dkim-keygen`, meaningful exit codes
 
-## 🚀 Quick start
+## Install
+
+```sh
+curl -fsSL https://glyndor.net/install/mail | sh
+```
+
+Installs the latest release binary to `/usr/local/bin`. Override with `INSTALL_DIR=/path/to/bin`.
+
+## 🚀 Quick start (from source)
 
 ```sh
 cargo build --release
