@@ -308,4 +308,28 @@ mod tests {
 		let result = token_hash_from(Cursor::new("my-token\r\n"));
 		assert_eq!(result, ExitCode::SUCCESS);
 	}
+
+	#[test]
+	fn token_hash_reports_stdin_io_error() {
+		struct AlwaysErrors;
+		impl std::io::Read for AlwaysErrors {
+			fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+				Err(std::io::Error::new(
+					std::io::ErrorKind::BrokenPipe,
+					"simulated",
+				))
+			}
+		}
+		impl std::io::BufRead for AlwaysErrors {
+			fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+				Err(std::io::Error::new(
+					std::io::ErrorKind::BrokenPipe,
+					"simulated",
+				))
+			}
+			fn consume(&mut self, _: usize) {}
+		}
+		let result = token_hash_from(AlwaysErrors);
+		assert_eq!(result, ExitCode::FAILURE);
+	}
 }
