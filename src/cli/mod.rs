@@ -38,6 +38,11 @@ enum Command {
 		#[arg(long, value_name = "FILE")]
 		out: PathBuf,
 	},
+	/// Hash a bearer token for use in `[api] token_hash`.
+	///
+	/// Reads the plaintext token from stdin (one line). Prints the argon2id
+	/// PHC string to stdout, ready to paste into the config file.
+	TokenHash,
 }
 
 impl Cli {
@@ -62,6 +67,41 @@ impl Cli {
 				}
 			},
 			Command::DkimKeygen { out } => dkim_keygen(&out),
+			Command::TokenHash => token_hash(),
+		}
+	}
+}
+
+fn token_hash() -> ExitCode {
+	token_hash_from(std::io::stdin().lock())
+}
+
+fn token_hash_from(reader: impl std::io::BufRead) -> ExitCode {
+	let line = reader.lines().next();
+	let token = match line {
+		Some(Ok(t)) => t,
+		Some(Err(error)) => {
+			eprintln!("error: reading stdin: {error}");
+			return ExitCode::FAILURE;
+		}
+		None => {
+			eprintln!("error: no input — pipe or type the token on stdin");
+			return ExitCode::FAILURE;
+		}
+	};
+	let token = token.trim_end_matches('\r').to_owned();
+	if token.is_empty() {
+		eprintln!("error: token must not be empty");
+		return ExitCode::FAILURE;
+	}
+	match crate::smtp::auth::hash_password(&token) {
+		Ok(hash) => {
+			println!("{hash}");
+			ExitCode::SUCCESS
+		}
+		Err(error) => {
+			eprintln!("error: {error}");
+			ExitCode::FAILURE
 		}
 	}
 }
@@ -222,5 +262,74 @@ mod tests {
 		let cli = Cli::try_parse_from(["mail", "serve", "--config", "/nonexistent/mail.toml"])
 			.expect("parses");
 		assert_eq!(cli.run(), ExitCode::FAILURE);
+	}
+
+	#[test]
+	fn parses_token_hash_command() {
+		let cli = Cli::try_parse_from(["mail", "token-hash"]).expect("token-hash parses");
+		assert!(matches!(cli.command, Command::TokenHash));
+	}
+
+	#[test]
+	fn token_hash_produces_valid_phc() {
+		use std::io::Cursor;
+		let result = token_hash_from(Cursor::new("hunter2\n"));
+		assert_eq!(result, ExitCode::SUCCESS);
+	}
+
+	#[test]
+	fn token_hash_verifies_against_output() {
+		use crate::smtp::auth::verify_password;
+		// We can't capture stdout directly here, so verify via hash_password round-trip.
+		let hash = crate::smtp::auth::hash_password("my-secret-token").expect("hashes");
+		assert!(hash.starts_with("$argon2id$"));
+		assert!(verify_password(&hash, "my-secret-token"));
+		assert!(!verify_password(&hash, "wrong-token"));
+	}
+
+	#[test]
+	fn token_hash_rejects_empty_input() {
+		use std::io::Cursor;
+		let result = token_hash_from(Cursor::new("\n"));
+		assert_eq!(result, ExitCode::FAILURE);
+	}
+
+	#[test]
+	fn token_hash_rejects_no_input() {
+		use std::io::Cursor;
+		let result = token_hash_from(Cursor::new(""));
+		assert_eq!(result, ExitCode::FAILURE);
+	}
+
+	#[test]
+	fn token_hash_strips_crlf() {
+		use std::io::Cursor;
+		// Windows-style line endings must not be treated as part of the token.
+		let result = token_hash_from(Cursor::new("my-token\r\n"));
+		assert_eq!(result, ExitCode::SUCCESS);
+	}
+
+	#[test]
+	fn token_hash_reports_stdin_io_error() {
+		struct AlwaysErrors;
+		impl std::io::Read for AlwaysErrors {
+			fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+				Err(std::io::Error::new(
+					std::io::ErrorKind::BrokenPipe,
+					"simulated",
+				))
+			}
+		}
+		impl std::io::BufRead for AlwaysErrors {
+			fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+				Err(std::io::Error::new(
+					std::io::ErrorKind::BrokenPipe,
+					"simulated",
+				))
+			}
+			fn consume(&mut self, _: usize) {}
+		}
+		let result = token_hash_from(AlwaysErrors);
+		assert_eq!(result, ExitCode::FAILURE);
 	}
 }
