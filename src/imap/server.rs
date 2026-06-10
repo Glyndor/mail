@@ -30,6 +30,9 @@ const MAX_CONNECTIONS: usize = 500;
 /// after 30 minutes of inactivity; we enforce it to kill Slowloris sessions.
 const READ_TIMEOUT: Duration = Duration::from_secs(1800);
 
+/// How often to poll for new messages during IDLE.
+const IDLE_POLL: Duration = Duration::from_secs(30);
+
 /// Anything the connection loop can read from and write to.
 trait Connection: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Connection for T {}
@@ -194,7 +197,8 @@ impl Server {
 					break;
 				}
 				if output.idle {
-					// Read lines until DONE.
+					// Poll for new messages at IDLE_POLL intervals; close after READ_TIMEOUT.
+					let idle_start = tokio::time::Instant::now();
 					loop {
 						match decoder.next_line() {
 							Ok(Some(line)) => {
@@ -204,20 +208,32 @@ impl Server {
 								// Anything else during IDLE is ignored.
 							}
 							Ok(None) => {
-								let read = match tokio::time::timeout(
-									READ_TIMEOUT,
-									stream.read(&mut buffer),
-								)
-								.await
-								{
-									Ok(Ok(n)) => n,
-									Ok(Err(e)) => return Err(e),
-									Err(_) => {
-										tracing::debug!("IMAP idle timeout during IDLE, closing");
-										let _ = stream.write_all(b"* BYE idle timeout\r\n").await;
-										return Ok(());
-									}
-								};
+								if idle_start.elapsed() >= READ_TIMEOUT {
+									tracing::debug!("IMAP idle timeout during IDLE, closing");
+									let _ = stream.write_all(b"* BYE idle timeout\r\n").await;
+									return Ok(());
+								}
+								let read =
+									match tokio::time::timeout(IDLE_POLL, stream.read(&mut buffer))
+										.await
+									{
+										Ok(Ok(n)) => n,
+										Ok(Err(e)) => return Err(e),
+										Err(_) => {
+											// Poll interval expired; check for new messages.
+											if let Some(notification) = session.check_idle() {
+												if stream
+													.write_all(&notification.bytes)
+													.await
+													.is_err()
+												{
+													return Ok(());
+												}
+												let _ = stream.flush().await;
+											}
+											continue;
+										}
+									};
 								if read == 0 {
 									return Ok(());
 								}

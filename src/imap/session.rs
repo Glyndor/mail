@@ -55,6 +55,7 @@ enum State {
 	},
 	Selected {
 		account: String,
+		mailbox: String,
 		snapshot: Snapshot,
 		read_only: bool,
 	},
@@ -315,6 +316,7 @@ impl Session {
 		);
 		self.state = State::Selected {
 			account,
+			mailbox: mailbox.to_string(),
 			snapshot,
 			read_only,
 		};
@@ -413,6 +415,7 @@ impl Session {
 			account,
 			snapshot,
 			read_only,
+			..
 		} = &mut self.state
 		else {
 			return Output::text(format!("{tag} BAD no mailbox selected\r\n"));
@@ -567,6 +570,33 @@ impl Session {
 		match self.idle_tag.take() {
 			Some(tag) => Output::text(format!("{tag} OK IDLE terminated\r\n")),
 			None => Output::text("* BAD not idling\r\n".to_string()),
+		}
+	}
+
+	/// Poll for mailbox changes during IDLE. Refreshes the snapshot and emits
+	/// untagged EXISTS/FLAGS responses if the message count changed. Returns
+	/// `None` when not in IDLE or no mailbox is selected.
+	pub fn check_idle(&mut self) -> Option<Output> {
+		self.idle_tag.as_ref()?;
+		let State::Selected {
+			account,
+			mailbox,
+			snapshot,
+			..
+		} = &mut self.state
+		else {
+			return None;
+		};
+		let fresh = match Snapshot::open(&self.data_dir, account, mailbox) {
+			Ok(s) => s,
+			Err(_) => return None,
+		};
+		if fresh.uid_validity() != snapshot.uid_validity() || fresh.len() != snapshot.len() {
+			let exists = fresh.len();
+			*snapshot = fresh;
+			Some(Output::text(format!("* {exists} EXISTS\r\n")))
+		} else {
+			None
 		}
 	}
 
@@ -1144,6 +1174,40 @@ mod tests {
 		let output = session.command_line("a1 IDLE");
 		assert!(text(&output).contains("a1 NO"));
 		assert!(!output.idle);
+	}
+
+	#[test]
+	fn check_idle_detects_new_messages() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		deliver(dir.path(), b"From: a@example.org\r\n\r\none\r\n");
+		let mut session = logged_in(dir.path());
+		session.command_line("a2 SELECT INBOX");
+		let output = session.command_line("a3 IDLE");
+		assert!(output.idle, "should enter IDLE");
+
+		// No change yet — check_idle returns None.
+		assert!(session.check_idle().is_none());
+
+		// Deliver a second message while idle.
+		deliver(dir.path(), b"From: b@example.org\r\n\r\ntwo\r\n");
+
+		// check_idle should now return an EXISTS notification.
+		let notification = session.check_idle().expect("should get notification");
+		let msg = text(&notification);
+		assert!(msg.contains("* 2 EXISTS"), "{msg}");
+
+		// Subsequent call returns None (no more changes).
+		assert!(session.check_idle().is_none());
+	}
+
+	#[test]
+	fn check_idle_returns_none_when_not_idling() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let mut session = logged_in(dir.path());
+		// Not in IDLE — should be None even if mailbox changes.
+		assert!(session.check_idle().is_none());
+		session.command_line("a2 SELECT INBOX");
+		assert!(session.check_idle().is_none());
 	}
 
 	#[test]
