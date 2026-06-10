@@ -476,35 +476,16 @@ impl Session {
 
 		let total = u32::try_from(snapshot.len()).unwrap_or(u32::MAX);
 		let mut hits = Vec::new();
-		for sequence_number in 1..=total {
-			let Some(message) = snapshot.by_sequence(sequence_number) else {
+		for seqno in 1..=total {
+			let Some(message) = snapshot.by_sequence(seqno) else {
 				continue;
 			};
-			// Message content loaded lazily: only for content criteria.
 			let mut content: Option<String> = None;
-			let load = |snapshot: &Snapshot| -> String {
-				snapshot
-					.read(message)
-					.map(|data| String::from_utf8_lossy(&data).to_ascii_lowercase())
-					.unwrap_or_default()
-			};
-
-			let matches = criteria.iter().all(|key| match key {
-				SearchKey::All => true,
-				SearchKey::FlagIs(flag, wanted) => message.flags.contains(flag) == *wanted,
-				SearchKey::Sequence(set) => set.contains(sequence_number, total),
-				SearchKey::UidSet(set) => set.contains(message.uid, total),
-				SearchKey::Header(name, needle) => {
-					let text = content.get_or_insert_with(|| load(snapshot));
-					header_value(text, name).is_some_and(|value| value.contains(needle.as_str()))
-				}
-				SearchKey::Text(needle) => {
-					let text = content.get_or_insert_with(|| load(snapshot));
-					text.contains(needle.as_str())
-				}
-			});
+			let matches = criteria
+				.iter()
+				.all(|key| search_matches(key, message, seqno, total, snapshot, &mut content));
 			if matches {
-				hits.push(if uid { message.uid } else { sequence_number });
+				hits.push(if uid { message.uid } else { seqno });
 			}
 		}
 
@@ -780,6 +761,75 @@ fn epoch_to_ymd(days: u64) -> (u64, u64, u64) {
 
 /// Extract a header value (lowercased input) from a lowercased message,
 /// folding included. `None` if the header is absent.
+fn search_matches(
+	key: &SearchKey,
+	message: &mailbox::MessageRef,
+	seqno: u32,
+	total: u32,
+	snapshot: &Snapshot,
+	content: &mut Option<String>,
+) -> bool {
+	match key {
+		SearchKey::All => true,
+		SearchKey::FlagIs(flag, wanted) => message.flags.contains(flag) == *wanted,
+		SearchKey::Sequence(set) => set.contains(seqno, total),
+		SearchKey::UidSet(set) => set.contains(message.uid, total),
+		SearchKey::Header(name, needle) => {
+			let text = content.get_or_insert_with(|| load_content(snapshot, message));
+			header_value(text, name).is_some_and(|v| v.contains(needle.as_str()))
+		}
+		SearchKey::Text(needle) => {
+			let text = content.get_or_insert_with(|| load_content(snapshot, message));
+			text.contains(needle.as_str())
+		}
+		SearchKey::Or(a, b) => {
+			search_matches(a, message, seqno, total, snapshot, content)
+				|| search_matches(b, message, seqno, total, snapshot, content)
+		}
+		SearchKey::Not(k) => !search_matches(k, message, seqno, total, snapshot, content),
+		SearchKey::And(keys) => keys
+			.iter()
+			.all(|k| search_matches(k, message, seqno, total, snapshot, content)),
+		SearchKey::Before(y, m, d) => {
+			systemtime_to_epoch_day(message.internal_date) < date_to_epoch_day(*y, *m, *d)
+		}
+		SearchKey::Since(y, m, d) => {
+			systemtime_to_epoch_day(message.internal_date) >= date_to_epoch_day(*y, *m, *d)
+		}
+		SearchKey::On(y, m, d) => {
+			systemtime_to_epoch_day(message.internal_date) == date_to_epoch_day(*y, *m, *d)
+		}
+		SearchKey::Larger(n) => message.size > u64::from(*n),
+		SearchKey::Smaller(n) => message.size < u64::from(*n),
+	}
+}
+
+fn load_content(snapshot: &Snapshot, message: &mailbox::MessageRef) -> String {
+	snapshot
+		.read(message)
+		.map(|data| String::from_utf8_lossy(&data).to_ascii_lowercase())
+		.unwrap_or_default()
+}
+
+/// Convert (year, month, day) UTC to days-since-Unix-epoch.
+/// Algorithm: https://howardhinnant.github.io/date_algorithms.html
+fn date_to_epoch_day(year: u32, month: u8, day: u8) -> i64 {
+	let y = year as i64 - if month <= 2 { 1 } else { 0 };
+	let era = y.div_euclid(400);
+	let yoe = y - era * 400;
+	let m = month as i64;
+	let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day as i64 - 1;
+	let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+	era * 146097 + doe - 719468
+}
+
+fn systemtime_to_epoch_day(t: std::time::SystemTime) -> i64 {
+	match t.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+		Ok(d) => (d.as_secs() / 86400) as i64,
+		Err(e) => -((e.duration().as_secs() / 86400 + 1) as i64),
+	}
+}
+
 fn header_value(lower_message: &str, name: &str) -> Option<String> {
 	let header_end = lower_message
 		.find("\r\n\r\n")
@@ -1285,6 +1335,83 @@ mod tests {
 		session.command_line("a3 SELECT INBOX");
 		let response = text(&session.command_line("a4 SEARCH BOGUSKEY"));
 		assert!(response.contains("a4 BAD"), "{response}");
+	}
+
+	#[test]
+	fn search_or_not() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		deliver(dir.path(), b"From: a@example.org\r\n\r\none\r\n");
+		deliver(dir.path(), b"From: b@example.org\r\n\r\ntwo\r\n");
+		let mut session = logged_in(dir.path());
+		session.command_line("a2 SELECT INBOX");
+		session.command_line(r"a3 STORE 1 +FLAGS (\Seen)");
+
+		// OR SEEN FLAGGED → message 1 (seen) only
+		let response = text(&session.command_line("a4 SEARCH OR SEEN FLAGGED"));
+		assert!(response.contains("* SEARCH 1\r\n"), "{response}");
+
+		// OR SEEN UNSEEN → all
+		let response = text(&session.command_line("a5 SEARCH OR SEEN UNSEEN"));
+		assert!(response.contains("* SEARCH 1 2\r\n"), "{response}");
+
+		// NOT SEEN → message 2
+		let response = text(&session.command_line("a6 SEARCH NOT SEEN"));
+		assert!(response.contains("* SEARCH 2\r\n"), "{response}");
+
+		// Nested: OR (NOT SEEN) FLAGGED → message 2
+		let response = text(&session.command_line("a7 SEARCH OR (NOT SEEN) FLAGGED"));
+		assert!(response.contains("* SEARCH 2\r\n"), "{response}");
+	}
+
+	#[test]
+	fn search_date_criteria() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		deliver(dir.path(), b"From: a@example.org\r\n\r\nbody\r\n");
+		let mut session = logged_in(dir.path());
+		session.command_line("a2 SELECT INBOX");
+
+		// SINCE epoch: all messages match (files exist after 1970).
+		let response = text(&session.command_line("a3 SEARCH SINCE 1-Jan-1970"));
+		assert!(response.contains("* SEARCH 1\r\n"), "{response}");
+
+		// BEFORE far future: all messages match.
+		let response = text(&session.command_line("a4 SEARCH BEFORE 1-Jan-2200"));
+		assert!(response.contains("* SEARCH 1\r\n"), "{response}");
+
+		// SINCE far future: no messages match.
+		let response = text(&session.command_line("a5 SEARCH SINCE 1-Jan-2200"));
+		assert!(response.contains("* SEARCH\r\n"), "{response}");
+
+		// BEFORE epoch: no messages match (files are newer than 1970-01-01).
+		let response = text(&session.command_line("a6 SEARCH BEFORE 1-Jan-1970"));
+		assert!(response.contains("* SEARCH\r\n"), "{response}");
+	}
+
+	#[test]
+	fn search_larger_smaller() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let short = b"From: a@example.org\r\n\r\nhi\r\n";
+		let long = b"From: b@example.org\r\n\r\nThis is a much longer message body.\r\n";
+		deliver(dir.path(), short);
+		deliver(dir.path(), long);
+		let mut session = logged_in(dir.path());
+		session.command_line("a2 SELECT INBOX");
+
+		// LARGER 5 → both messages (both > 5 bytes).
+		let response = text(&session.command_line("a3 SEARCH LARGER 5"));
+		assert!(response.contains("* SEARCH 1 2\r\n"), "{response}");
+
+		// LARGER 50 → only the long message (60 bytes > 50; short is 27 bytes).
+		let response = text(&session.command_line("a4 SEARCH LARGER 50"));
+		assert!(response.contains("* SEARCH 2\r\n"), "{response}");
+
+		// SMALLER 50 → only the short message (27 bytes < 50; long is 60 bytes).
+		let response = text(&session.command_line("a5 SEARCH SMALLER 50"));
+		assert!(response.contains("* SEARCH 1\r\n"), "{response}");
+
+		// SMALLER 5 → no messages (both > 5 bytes).
+		let response = text(&session.command_line("a6 SEARCH SMALLER 5"));
+		assert!(response.contains("* SEARCH\r\n"), "{response}");
 	}
 
 	#[test]
