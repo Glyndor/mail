@@ -112,6 +112,22 @@ pub enum SearchKey {
 	Sequence(SequenceSet),
 	/// Explicit UID set (`UID <set>`).
 	UidSet(SequenceSet),
+	/// Logical OR of two criteria.
+	Or(Box<SearchKey>, Box<SearchKey>),
+	/// Logical NOT of one criterion.
+	Not(Box<SearchKey>),
+	/// Parenthesized group: implicitly AND'd (RFC 3501 §6.4.4 search-key).
+	And(Vec<SearchKey>),
+	/// INTERNALDATE strictly before midnight UTC of this date (year, month, day).
+	Before(u32, u8, u8),
+	/// INTERNALDATE on or after midnight UTC of this date.
+	Since(u32, u8, u8),
+	/// INTERNALDATE falls within this date (midnight to midnight UTC).
+	On(u32, u8, u8),
+	/// RFC 2822 size strictly greater than n octets.
+	Larger(u32),
+	/// RFC 2822 size strictly less than n octets.
+	Smaller(u32),
 }
 
 /// How STORE changes the flag set.
@@ -424,70 +440,178 @@ fn parse_append(tag: &str, args: &str) -> Result<Command, ParseError> {
 }
 
 fn parse_search(tag: &str, args: &str, uid: bool) -> Result<Command, ParseError> {
-	use crate::imap::mailbox::Flag;
 	let bad = || ParseError::BadArguments(tag.to_string());
-
 	let mut criteria = Vec::new();
 	let mut rest = args.trim();
 	while !rest.is_empty() {
-		let (word, after) = match rest.split_once(' ') {
-			Some((word, after)) => (word, after.trim_start()),
-			None => (rest, ""),
-		};
-		let upper = word.to_ascii_uppercase();
-		let key = match upper.as_str() {
-			"ALL" => {
-				rest = after;
-				criteria.push(SearchKey::All);
-				continue;
-			}
-			"SEEN" => SearchKey::FlagIs(Flag::Seen, true),
-			"UNSEEN" => SearchKey::FlagIs(Flag::Seen, false),
-			"DELETED" => SearchKey::FlagIs(Flag::Deleted, true),
-			"UNDELETED" => SearchKey::FlagIs(Flag::Deleted, false),
-			"FLAGGED" => SearchKey::FlagIs(Flag::Flagged, true),
-			"UNFLAGGED" => SearchKey::FlagIs(Flag::Flagged, false),
-			"ANSWERED" => SearchKey::FlagIs(Flag::Answered, true),
-			"UNANSWERED" => SearchKey::FlagIs(Flag::Answered, false),
-			"DRAFT" => SearchKey::FlagIs(Flag::Draft, true),
-			"UNDRAFT" => SearchKey::FlagIs(Flag::Draft, false),
-			"FROM" | "TO" | "SUBJECT" => {
-				let (needle, after_value) = parse_astring(after).ok_or_else(bad)?;
-				rest = after_value.trim_start();
-				criteria.push(SearchKey::Header(
-					upper.to_ascii_lowercase(),
-					needle.to_ascii_lowercase(),
-				));
-				continue;
-			}
-			"TEXT" => {
-				let (needle, after_value) = parse_astring(after).ok_or_else(bad)?;
-				rest = after_value.trim_start();
-				criteria.push(SearchKey::Text(needle.to_ascii_lowercase()));
-				continue;
-			}
-			"UID" => {
-				let (set_text, after_value) = match after.split_once(' ') {
-					Some((set_text, after_value)) => (set_text, after_value.trim_start()),
-					None => (after, ""),
-				};
-				let set = parse_sequence_set(set_text).ok_or_else(bad)?;
-				rest = after_value;
-				criteria.push(SearchKey::UidSet(set));
-				continue;
-			}
-			_ => match parse_sequence_set(word) {
-				Some(set) => SearchKey::Sequence(set),
-				None => return Err(bad()),
-			},
-		};
-		rest = after;
+		let (key, after) = parse_search_key(rest).ok_or_else(bad)?;
 		criteria.push(key);
+		rest = after.trim_start();
 	}
 	if criteria.is_empty() {
 		return Err(bad());
 	}
 	Ok(Command::Search { criteria, uid })
+}
+
+/// Parse one search-key from the start of `s`, return `(key, remaining)`.
+fn parse_search_key(s: &str) -> Option<(SearchKey, &str)> {
+	use crate::imap::mailbox::Flag;
+
+	if s.starts_with('(') {
+		let close = find_close_paren(s)?;
+		let inner = s[1..close].trim();
+		let after = s[close + 1..].trim_start();
+		let mut keys = Vec::new();
+		let mut inner_rest = inner;
+		while !inner_rest.is_empty() {
+			let (key, rest) = parse_search_key(inner_rest)?;
+			keys.push(key);
+			inner_rest = rest.trim_start();
+		}
+		return Some((SearchKey::And(keys), after));
+	}
+
+	let (word, after) = match s.find(|c: char| c.is_ascii_whitespace() || c == '(') {
+		Some(i) => (&s[..i], s[i..].trim_start()),
+		None => (s, ""),
+	};
+	let upper = word.to_ascii_uppercase();
+
+	let (key, rest) = match upper.as_str() {
+		"ALL" => (SearchKey::All, after),
+		"SEEN" => (SearchKey::FlagIs(Flag::Seen, true), after),
+		"UNSEEN" => (SearchKey::FlagIs(Flag::Seen, false), after),
+		"DELETED" => (SearchKey::FlagIs(Flag::Deleted, true), after),
+		"UNDELETED" => (SearchKey::FlagIs(Flag::Deleted, false), after),
+		"FLAGGED" => (SearchKey::FlagIs(Flag::Flagged, true), after),
+		"UNFLAGGED" => (SearchKey::FlagIs(Flag::Flagged, false), after),
+		"ANSWERED" => (SearchKey::FlagIs(Flag::Answered, true), after),
+		"UNANSWERED" => (SearchKey::FlagIs(Flag::Answered, false), after),
+		"DRAFT" => (SearchKey::FlagIs(Flag::Draft, true), after),
+		"UNDRAFT" => (SearchKey::FlagIs(Flag::Draft, false), after),
+		"FROM" | "TO" | "SUBJECT" => {
+			let (needle, rest) = parse_astring(after)?;
+			(
+				SearchKey::Header(upper.to_ascii_lowercase(), needle.to_ascii_lowercase()),
+				rest.trim_start(),
+			)
+		}
+		"TEXT" => {
+			let (needle, rest) = parse_astring(after)?;
+			(
+				SearchKey::Text(needle.to_ascii_lowercase()),
+				rest.trim_start(),
+			)
+		}
+		"UID" => {
+			let (set_text, rest) = match after.split_once(|c: char| c.is_ascii_whitespace()) {
+				Some((t, r)) => (t, r.trim_start()),
+				None => (after, ""),
+			};
+			let set = parse_sequence_set(set_text)?;
+			(SearchKey::UidSet(set), rest)
+		}
+		"OR" => {
+			let (key1, rest1) = parse_search_key(after.trim_start())?;
+			let (key2, rest2) = parse_search_key(rest1.trim_start())?;
+			(SearchKey::Or(Box::new(key1), Box::new(key2)), rest2)
+		}
+		"NOT" => {
+			let (key, rest) = parse_search_key(after.trim_start())?;
+			(SearchKey::Not(Box::new(key)), rest)
+		}
+		"BEFORE" => {
+			let (date_str, rest) = match after.split_once(|c: char| c.is_ascii_whitespace()) {
+				Some((d, r)) => (d, r.trim_start()),
+				None => (after, ""),
+			};
+			let (y, m, d) = parse_imap_date(date_str)?;
+			(SearchKey::Before(y, m, d), rest)
+		}
+		"SINCE" => {
+			let (date_str, rest) = match after.split_once(|c: char| c.is_ascii_whitespace()) {
+				Some((d, r)) => (d, r.trim_start()),
+				None => (after, ""),
+			};
+			let (y, m, d) = parse_imap_date(date_str)?;
+			(SearchKey::Since(y, m, d), rest)
+		}
+		"ON" => {
+			let (date_str, rest) = match after.split_once(|c: char| c.is_ascii_whitespace()) {
+				Some((d, r)) => (d, r.trim_start()),
+				None => (after, ""),
+			};
+			let (y, m, d) = parse_imap_date(date_str)?;
+			(SearchKey::On(y, m, d), rest)
+		}
+		"LARGER" => {
+			let (n_str, rest) = match after.split_once(|c: char| c.is_ascii_whitespace()) {
+				Some((n, r)) => (n, r.trim_start()),
+				None => (after, ""),
+			};
+			let n: u32 = n_str.parse().ok()?;
+			(SearchKey::Larger(n), rest)
+		}
+		"SMALLER" => {
+			let (n_str, rest) = match after.split_once(|c: char| c.is_ascii_whitespace()) {
+				Some((n, r)) => (n, r.trim_start()),
+				None => (after, ""),
+			};
+			let n: u32 = n_str.parse().ok()?;
+			(SearchKey::Smaller(n), rest)
+		}
+		_ => {
+			let set = parse_sequence_set(word)?;
+			(SearchKey::Sequence(set), after)
+		}
+	};
+	Some((key, rest))
+}
+
+/// Find the index of the `)` that closes the `(` at position 0 of `s`.
+fn find_close_paren(s: &str) -> Option<usize> {
+	let mut depth = 0usize;
+	for (i, c) in s.char_indices() {
+		match c {
+			'(' => depth += 1,
+			')' => {
+				depth -= 1;
+				if depth == 0 {
+					return Some(i);
+				}
+			}
+			_ => {}
+		}
+	}
+	None
+}
+
+/// Parse an IMAP date-text (`1-Jan-2023` or `01-Jan-2023`).
+/// Returns `(year, month, day)` on success.
+fn parse_imap_date(s: &str) -> Option<(u32, u8, u8)> {
+	let mut parts = s.splitn(3, '-');
+	let day: u8 = parts.next()?.parse().ok()?;
+	let month: u8 = match parts.next()?.to_ascii_uppercase().as_str() {
+		"JAN" => 1,
+		"FEB" => 2,
+		"MAR" => 3,
+		"APR" => 4,
+		"MAY" => 5,
+		"JUN" => 6,
+		"JUL" => 7,
+		"AUG" => 8,
+		"SEP" => 9,
+		"OCT" => 10,
+		"NOV" => 11,
+		"DEC" => 12,
+		_ => return None,
+	};
+	let year: u32 = parts.next()?.parse().ok()?;
+	if day == 0 || day > 31 || month == 0 || month > 12 {
+		return None;
+	}
+	Some((year, month, day))
 }
 
 fn parse_copy(
@@ -723,5 +847,108 @@ mod tests {
 			parse("a1 FETCH 1 (BOGUS)"),
 			Err(ParseError::BadArguments("a1".to_string()))
 		);
+	}
+
+	#[test]
+	fn parses_search_or_not() {
+		use crate::imap::mailbox::Flag;
+
+		let cmd = parse("a1 SEARCH OR SEEN FLAGGED").expect("parses");
+		assert!(
+			matches!(
+				cmd.command,
+				Command::Search {
+					ref criteria,
+					uid: false
+				} if criteria.len() == 1
+					&& matches!(
+						&criteria[0],
+						SearchKey::Or(a, b)
+						if **a == SearchKey::FlagIs(Flag::Seen, true)
+							&& **b == SearchKey::FlagIs(Flag::Flagged, true)
+					)
+			),
+			"{:?}",
+			cmd.command
+		);
+
+		let cmd = parse("a2 SEARCH NOT SEEN").expect("parses");
+		assert!(
+			matches!(
+				cmd.command,
+				Command::Search { ref criteria, .. }
+				if criteria.len() == 1
+					&& matches!(
+						&criteria[0],
+						SearchKey::Not(k) if **k == SearchKey::FlagIs(Flag::Seen, true)
+					)
+			),
+			"{:?}",
+			cmd.command
+		);
+	}
+
+	#[test]
+	fn parses_search_date_and_size() {
+		let cmd = parse("a1 SEARCH BEFORE 1-Jan-2024").expect("parses");
+		assert!(
+			matches!(
+				cmd.command,
+				Command::Search { ref criteria, .. }
+				if matches!(criteria[0], SearchKey::Before(2024, 1, 1))
+			),
+			"{:?}",
+			cmd.command
+		);
+
+		let cmd = parse("a2 SEARCH SINCE 15-Jun-2023 SMALLER 1000").expect("parses");
+		assert!(
+			matches!(
+				cmd.command,
+				Command::Search { ref criteria, .. }
+				if matches!(criteria[0], SearchKey::Since(2023, 6, 15))
+					&& matches!(criteria[1], SearchKey::Smaller(1000))
+			),
+			"{:?}",
+			cmd.command
+		);
+	}
+
+	#[test]
+	fn parses_search_nested_paren_group() {
+		use crate::imap::mailbox::Flag;
+
+		// OR (NOT SEEN) FLAGGED
+		let cmd = parse("a1 SEARCH OR (NOT SEEN) FLAGGED").expect("parses");
+		assert!(
+			matches!(
+				cmd.command,
+				Command::Search { ref criteria, .. }
+				if criteria.len() == 1
+					&& matches!(
+						&criteria[0],
+						SearchKey::Or(a, b)
+						if matches!(
+							a.as_ref(),
+							SearchKey::And(keys)
+							if keys.len() == 1
+								&& matches!(&keys[0], SearchKey::Not(k) if **k == SearchKey::FlagIs(Flag::Seen, true))
+						)
+						&& **b == SearchKey::FlagIs(Flag::Flagged, true)
+					)
+			),
+			"{:?}",
+			cmd.command
+		);
+	}
+
+	#[test]
+	fn parses_imap_date() {
+		assert_eq!(super::parse_imap_date("1-Jan-2024"), Some((2024, 1, 1)));
+		assert_eq!(super::parse_imap_date("31-Dec-1999"), Some((1999, 12, 31)));
+		assert_eq!(super::parse_imap_date("15-Jun-2023"), Some((2023, 6, 15)));
+		assert_eq!(super::parse_imap_date("01-Jan-2024"), Some((2024, 1, 1)));
+		assert_eq!(super::parse_imap_date("1-Bad-2024"), None);
+		assert_eq!(super::parse_imap_date("0-Jan-2024"), None);
 	}
 }
