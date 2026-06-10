@@ -3,9 +3,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::config::Tls;
 
@@ -38,11 +39,11 @@ pub fn acceptor(config: &Tls) -> Result<TlsAcceptor, TlsError> {
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
-	let pem = std::fs::read(path).map_err(|source| TlsError::Read {
-		path: path.display().to_string(),
-		source,
-	})?;
-	let certs: Vec<_> = rustls_pemfile::certs(&mut pem.as_slice())
+	let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
+		.map_err(|source| TlsError::Read {
+			path: path.display().to_string(),
+			source: std::io::Error::other(source),
+		})?
 		.collect::<Result<_, _>>()
 		.map_err(|error| TlsError::Invalid(error.to_string()))?;
 	if certs.is_empty() {
@@ -52,13 +53,16 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
 }
 
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
-	let pem = std::fs::read(path).map_err(|source| TlsError::Read {
-		path: path.display().to_string(),
-		source,
-	})?;
-	rustls_pemfile::private_key(&mut pem.as_slice())
-		.map_err(|error| TlsError::Invalid(error.to_string()))?
-		.ok_or_else(|| TlsError::NoPrivateKey(path.display().to_string()))
+	PrivateKeyDer::from_pem_file(path).map_err(|error| match error {
+		rustls_pki_types::pem::Error::NoItemsFound => {
+			TlsError::NoPrivateKey(path.display().to_string())
+		}
+		rustls_pki_types::pem::Error::Io(source) => TlsError::Read {
+			path: path.display().to_string(),
+			source,
+		},
+		other => TlsError::Invalid(other.to_string()),
+	})
 }
 
 /// Test-only helpers shared across modules.
