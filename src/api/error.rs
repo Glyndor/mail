@@ -45,6 +45,14 @@ impl ApiError {
 			message: "Internal error.".to_string(),
 		}
 	}
+
+	pub fn rate_limited() -> Self {
+		ApiError {
+			status: StatusCode::TOO_MANY_REQUESTS,
+			code: "rate_limited",
+			message: "Too many failed authentication attempts. Try again later.".to_string(),
+		}
+	}
 }
 
 #[derive(Serialize)]

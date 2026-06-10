@@ -12,11 +12,14 @@ pub use state::ApiState;
 
 use axum::Router;
 use axum::middleware;
+use tower_http::cors::CorsLayer;
 
 /// Build the API router with authentication applied to every route.
 pub fn router(state: ApiState) -> Router {
 	Router::new()
 		.nest("/api/v1", v1::router())
+		// Deny all CORS: no origins, methods, or headers are allowed.
+		.layer(CorsLayer::new())
 		.layer(middleware::from_fn_with_state(
 			state.clone(),
 			state::require_bearer_token,
@@ -35,6 +38,19 @@ mod tests {
 	use crate::storage::FsSpool;
 
 	const TOKEN: &str = "test-token";
+
+	fn sha256_hash(token: &str) -> String {
+		let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
+		let hex = digest
+			.as_ref()
+			.iter()
+			.fold(String::with_capacity(64), |mut s, b| {
+				use std::fmt::Write;
+				write!(s, "{b:02x}").ok();
+				s
+			});
+		format!("sha256:{hex}")
+	}
 
 	fn test_state(dir: &std::path::Path, queued: usize) -> ApiState {
 		let spool = FsSpool::open(dir).expect("open spool");
@@ -312,5 +328,38 @@ mod tests {
 		let app = router(test_state(dir.path(), 0));
 		let (status, _) = request(&app, "GET", "/api/v1/nope", Some(TOKEN)).await;
 		assert_eq!(status, StatusCode::NOT_FOUND);
+	}
+
+	#[tokio::test]
+	async fn sha256_token_format_is_accepted() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let spool = FsSpool::open(dir.path()).expect("spool");
+		let store = std::sync::Arc::new(
+			crate::directory_store::AccountStore::open(
+				dir.path(),
+				vec!["example.org".to_string()],
+				vec![],
+			)
+			.expect("store"),
+		);
+		let state = ApiState::new(&sha256_hash(TOKEN), vec![], store, spool);
+		let app = router(state);
+		let (status, _) = request(&app, "GET", "/api/v1/status", Some(TOKEN)).await;
+		assert_eq!(status, StatusCode::OK);
+		let (status, _) = request(&app, "GET", "/api/v1/status", Some("wrong")).await;
+		assert_eq!(status, StatusCode::UNAUTHORIZED);
+	}
+
+	#[tokio::test]
+	async fn rate_limit_triggers_after_repeated_failures() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let app = router(test_state(dir.path(), 0));
+		for _ in 0..20 {
+			let (status, _) = request(&app, "GET", "/api/v1/status", Some("wrong")).await;
+			assert_eq!(status, StatusCode::UNAUTHORIZED);
+		}
+		let (status, body) = request(&app, "GET", "/api/v1/status", Some("wrong")).await;
+		assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+		assert_eq!(body["error"]["code"], "rate_limited");
 	}
 }

@@ -1154,6 +1154,7 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "tower",
+ "tower-http",
  "tracing",
  "uuid",
  "webpki-roots",
