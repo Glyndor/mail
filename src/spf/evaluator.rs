@@ -146,7 +146,13 @@ async fn check_host_inner(
 					Err(e) => return e,
 				};
 				match Box::pin(check_host_inner(
-					dns, ip, &included, sender, helo, budget, depth + 1,
+					dns,
+					ip,
+					&included,
+					sender,
+					helo,
+					budget,
+					depth + 1,
 				))
 				.await
 				{
@@ -180,8 +186,16 @@ async fn check_host_inner(
 			Ok(d) => d,
 			Err(e) => return e,
 		};
-		let outcome =
-			Box::pin(check_host_inner(dns, ip, &target, sender, helo, budget, depth + 1)).await;
+		let outcome = Box::pin(check_host_inner(
+			dns,
+			ip,
+			&target,
+			sender,
+			helo,
+			budget,
+			depth + 1,
+		))
+		.await;
 		// A redirect target without a record is a permerror (section 6.1).
 		return if outcome == SpfOutcome::None {
 			SpfOutcome::PermError
@@ -284,8 +298,13 @@ pub(crate) fn expand_macro(
 				let close = rest.find('}').ok_or(SpfOutcome::PermError)?;
 				let inner = &rest[1..close];
 				rest = &rest[close + 1..];
-				result
-					.push_str(&expand_macro_inner(inner, ip, current_domain, sender, helo)?);
+				result.push_str(&expand_macro_inner(
+					inner,
+					ip,
+					current_domain,
+					sender,
+					helo,
+				)?);
 			}
 			_ => return Err(SpfOutcome::PermError),
 		}
@@ -342,9 +361,7 @@ fn expand_macro_inner(
 
 /// Parse `[digit][r][delimiter...]` macro transformers (RFC 7208 §7.1).
 fn parse_macro_transformers(s: &str) -> Result<(Option<usize>, bool, Vec<char>), SpfOutcome> {
-	let count_end = s
-		.find(|c: char| !c.is_ascii_digit())
-		.unwrap_or(s.len());
+	let count_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
 	let count = if count_end == 0 {
 		None
 	} else {
@@ -383,12 +400,7 @@ fn ip_to_macro_str(ip: IpAddr) -> String {
 			let nibbles: Vec<String> = v6
 				.octets()
 				.iter()
-				.flat_map(|&b| {
-					[
-						format!("{:x}", (b >> 4) & 0xf),
-						format!("{:x}", b & 0xf),
-					]
-				})
+				.flat_map(|&b| [format!("{:x}", (b >> 4) & 0xf), format!("{:x}", b & 0xf)])
 				.collect();
 			nibbles.join(".")
 		}

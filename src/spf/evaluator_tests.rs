@@ -303,7 +303,13 @@ fn expand_ir_in_dnsbl_spec() {
 #[test]
 fn expand_d_is_current_domain() {
 	assert_eq!(
-		expand_macro("mail.%{d}", v4("1.2.3.4"), "example.org", "s@e.org", "e.org"),
+		expand_macro(
+			"mail.%{d}",
+			v4("1.2.3.4"),
+			"example.org",
+			"s@e.org",
+			"e.org"
+		),
 		Ok("mail.example.org".to_string())
 	);
 }
@@ -369,7 +375,13 @@ fn expand_o_is_sender_domain() {
 #[test]
 fn expand_h_is_helo_domain() {
 	assert_eq!(
-		expand_macro("%{h}", v4("1.2.3.4"), "example.org", "s@e.org", "helo.example"),
+		expand_macro(
+			"%{h}",
+			v4("1.2.3.4"),
+			"example.org",
+			"s@e.org",
+			"helo.example"
+		),
 		Ok("helo.example".to_string())
 	);
 }
@@ -394,7 +406,13 @@ fn expand_dr_reverses_domain_labels() {
 #[test]
 fn expand_no_macro_is_noop() {
 	assert_eq!(
-		expand_macro("plain.domain", v4("1.2.3.4"), "example.org", "s@e.org", "e.org"),
+		expand_macro(
+			"plain.domain",
+			v4("1.2.3.4"),
+			"example.org",
+			"s@e.org",
+			"e.org"
+		),
 		Ok("plain.domain".to_string())
 	);
 }
