@@ -34,6 +34,15 @@ pub enum Mechanism {
 	Include {
 		domain: String,
 	},
+	/// `exists:domain` — matches if the domain has any A/AAAA record.
+	Exists {
+		domain: String,
+	},
+	/// `ptr` / `ptr:domain` — deprecated (RFC 7208 §5.5); retained for
+	/// compatibility but treated as always non-matching at evaluation.
+	Ptr {
+		domain: Option<String>,
+	},
 }
 
 /// A parsed SPF record.
@@ -124,6 +133,21 @@ fn parse_mechanism(body: &str) -> Result<Mechanism, RecordError> {
 			prefix4,
 			prefix6,
 		});
+	}
+	if let Some(value) = lower.strip_prefix("exists:") {
+		if value.is_empty() {
+			return Err(RecordError("exists without domain".into()));
+		}
+		return Ok(Mechanism::Exists {
+			domain: value.to_string(),
+		});
+	}
+	if lower == "ptr" || lower.starts_with("ptr:") {
+		let domain = lower
+			.strip_prefix("ptr:")
+			.filter(|d| !d.is_empty())
+			.map(str::to_string);
+		return Ok(Mechanism::Ptr { domain });
 	}
 	Err(RecordError(format!("unsupported mechanism \"{body}\"")))
 }
@@ -257,9 +281,30 @@ mod tests {
 
 	#[test]
 	fn rejects_unknown_mechanism_and_duplicates() {
-		assert!(parse("v=spf1 ptr -all").is_err());
 		assert!(parse("v=spf1 redirect=a.example redirect=b.example").is_err());
 		assert!(parse("v=spf1 include:").is_err());
+		assert!(parse("v=spf1 exists:").is_err());
+	}
+
+	#[test]
+	fn parses_exists_and_ptr() {
+		let record = parse("v=spf1 exists:_spf.%{d}.example.org ptr ?all").expect("valid");
+		assert_eq!(
+			record.directives[0].1,
+			Mechanism::Exists {
+				domain: "_spf.%{d}.example.org".into()
+			}
+		);
+		assert_eq!(record.directives[1].1, Mechanism::Ptr { domain: None });
+		assert_eq!(record.directives[2].1, Mechanism::All);
+
+		let record = parse("v=spf1 ptr:example.org -all").expect("valid");
+		assert_eq!(
+			record.directives[0].1,
+			Mechanism::Ptr {
+				domain: Some("example.org".into())
+			}
+		);
 	}
 
 	#[test]
