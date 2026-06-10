@@ -121,20 +121,16 @@ impl Server {
 			let line = match decoder.next_line() {
 				Ok(Some(line)) => line,
 				Ok(None) => {
-					let read = match tokio::time::timeout(
-						READ_TIMEOUT,
-						stream.read(&mut buffer),
-					)
-					.await
-					{
-						Ok(Ok(n)) => n,
-						Ok(Err(e)) => return Err(e),
-						Err(_) => {
-							tracing::debug!("IMAP idle timeout, closing connection");
-							let _ = stream.write_all(b"* BYE idle timeout\r\n").await;
-							return Ok(());
-						}
-					};
+					let read =
+						match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut buffer)).await {
+							Ok(Ok(n)) => n,
+							Ok(Err(e)) => return Err(e),
+							Err(_) => {
+								tracing::debug!("IMAP idle timeout, closing connection");
+								let _ = stream.write_all(b"* BYE idle timeout\r\n").await;
+								return Ok(());
+							}
+						};
 					if read == 0 {
 						return Ok(());
 					}

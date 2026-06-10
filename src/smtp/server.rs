@@ -158,11 +158,8 @@ impl Server {
 			let line = match decoder.next_line() {
 				Ok(Some(line)) => line,
 				Ok(None) => {
-					let read = match tokio::time::timeout(
-						COMMAND_TIMEOUT,
-						stream.read(&mut buffer),
-					)
-					.await
+					let read = match tokio::time::timeout(COMMAND_TIMEOUT, stream.read(&mut buffer))
+						.await
 					{
 						Ok(Ok(n)) => n,
 						Ok(Err(e)) => return Err(e),
