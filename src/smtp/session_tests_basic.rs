@@ -53,10 +53,10 @@ fn full_transaction_delivers_message() {
 	let action = session.command_line("DATA");
 	assert!(matches!(action, Action::CollectData(_)));
 
-	assert_eq!(session.data_line("Subject: hi"), None);
-	assert_eq!(session.data_line(""), None);
-	assert_eq!(session.data_line("hello"), None);
-	let Some(Action::Deliver(reply, message)) = session.data_line(".") else {
+	assert_eq!(session.data_line(b"Subject: hi"), None);
+	assert_eq!(session.data_line(b""), None);
+	assert_eq!(session.data_line(b"hello"), None);
+	let Some(Action::Deliver(reply, message)) = session.data_line(b".") else {
 		panic!("expected delivery");
 	};
 	assert_eq!(reply.code(), 250);
@@ -71,8 +71,8 @@ fn dot_stuffed_lines_are_unstuffed() {
 	session.command_line("MAIL FROM:<a@example.org>");
 	session.command_line("RCPT TO:<b@example.org>");
 	session.command_line("DATA");
-	assert_eq!(session.data_line("..leading dot"), None);
-	let Some(Action::Deliver(_, message)) = session.data_line(".") else {
+	assert_eq!(session.data_line(b"..leading dot"), None);
+	let Some(Action::Deliver(_, message)) = session.data_line(b".") else {
 		panic!("expected delivery");
 	};
 	assert_eq!(message.data, b".leading dot\r\n");
@@ -251,9 +251,9 @@ fn oversize_message_is_rejected_and_not_delivered() {
 	let chunk = "x".repeat(1024);
 	let lines_needed = MAX_MESSAGE_SIZE / chunk.len() + 1;
 	for _ in 0..lines_needed {
-		assert_eq!(session.data_line(&chunk), None);
+		assert_eq!(session.data_line(chunk.as_bytes()), None);
 	}
-	let Some(action) = session.data_line(".") else {
+	let Some(action) = session.data_line(b".") else {
 		panic!("expected final action");
 	};
 	assert_eq!(reply_code(&action), 552);
@@ -263,7 +263,7 @@ fn oversize_message_is_rejected_and_not_delivered() {
 #[test]
 fn data_line_outside_data_state_fails_closed() {
 	let mut session = greeted();
-	let action = session.data_line("stray");
+	let action = session.data_line(b"stray");
 	assert_eq!(action.map(|a| reply_code(&a)), Some(503));
 }
 
@@ -273,8 +273,8 @@ fn second_transaction_works_after_delivery() {
 	session.command_line("MAIL FROM:<a@example.org>");
 	session.command_line("RCPT TO:<b@example.org>");
 	session.command_line("DATA");
-	session.data_line("first");
-	assert!(matches!(session.data_line("."), Some(Action::Deliver(..))));
+	session.data_line(b"first");
+	assert!(matches!(session.data_line(b"."), Some(Action::Deliver(..))));
 
 	assert_eq!(
 		reply_code(&session.command_line("MAIL FROM:<c@example.org>")),

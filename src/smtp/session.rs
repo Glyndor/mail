@@ -354,7 +354,7 @@ impl Session {
 
 	/// Feed one data line (CRLF already stripped and enforced upstream).
 	/// Returns `None` while more lines are expected.
-	pub fn data_line(&mut self, line: &str) -> Option<Action> {
+	pub fn data_line(&mut self, line: &[u8]) -> Option<Action> {
 		let State::ReceivingData {
 			reverse_path,
 			recipients,
@@ -367,7 +367,7 @@ impl Session {
 			return Some(Action::Continue(Reply::bad_sequence()));
 		};
 
-		if line == "." {
+		if line == b"." {
 			let message = AcceptedMessage {
 				reverse_path: reverse_path.clone(),
 				recipients: recipients.clone(),
@@ -385,10 +385,10 @@ impl Session {
 		}
 
 		// Dot-unstuffing (RFC 5321 section 4.5.2).
-		let content = line.strip_prefix('.').unwrap_or(line);
+		let content = line.strip_prefix(b".").unwrap_or(line);
 		*size += content.len() + 2;
 		if *size <= MAX_MESSAGE_SIZE {
-			body.extend_from_slice(content.as_bytes());
+			body.extend_from_slice(content);
 			body.extend_from_slice(b"\r\n");
 		}
 		None

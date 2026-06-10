@@ -190,26 +190,29 @@ impl Server {
 				}
 			};
 
-			let Ok(line) = String::from_utf8(line) else {
-				if mode == Mode::Commands {
-					send(&mut stream, &Reply::syntax_error()).await?;
-					continue;
+			// In Data mode, pass raw bytes to support 8BITMIME (RFC 6152).
+			let action = if mode == Mode::Data {
+				session.data_line(&line)
+			} else {
+				let Ok(line_str) = String::from_utf8(line) else {
+					if mode == Mode::Commands {
+						send(&mut stream, &Reply::syntax_error()).await?;
+						continue;
+					}
+					// Auth responses must be ASCII; abort.
+					send(
+						&mut stream,
+						&Reply::single(501, "non-ASCII in AUTH response"),
+					)
+					.await?;
+					return Ok(());
+				};
+				match mode {
+					Mode::Commands => Some(session.command_line(&line_str)),
+					// Argon2 is CPU-bound; per-connection rate limiting keeps attempts scarce.
+					Mode::Auth => Some(session.auth_line(&line_str)),
+					Mode::Data => unreachable!(),
 				}
-				// Binary in DATA: not yet supported, fail the transaction.
-				send(
-					&mut stream,
-					&Reply::single(554, "8-bit data not yet supported"),
-				)
-				.await?;
-				return Ok(());
-			};
-
-			let action = match mode {
-				Mode::Commands => Some(session.command_line(&line)),
-				Mode::Data => session.data_line(&line),
-				// Argon2 verification is CPU-bound; acceptable inline while
-				// per-connection rate limiting keeps attempts scarce.
-				Mode::Auth => Some(session.auth_line(&line)),
 			};
 			let Some(action) = action else {
 				continue;
@@ -608,15 +611,20 @@ QUIT\r\n";
 	}
 
 	#[tokio::test]
-	async fn invalid_utf8_in_data_fails_transaction() {
+	async fn eight_bit_data_in_message_body_is_accepted() {
+		// 8BITMIME: raw 8-bit content in the DATA phase must be accepted.
 		let script = b"EHLO client.example.org\r\n\
 MAIL FROM:<a@example.org>\r\n\
 RCPT TO:<b@example.org>\r\n\
 DATA\r\n\
-\xFF\xFE binary\r\n";
+Subject: test\r\n\
+\xFF\xFE binary content\r\n\
+.\r\n";
 		let (output, sink) = converse(script).await;
-		assert!(output.contains("554 8-bit data"), "{output}");
-		assert!(sink.messages().is_empty());
+		assert!(output.contains("250"), "{output}");
+		assert_eq!(sink.messages().len(), 1);
+		let data = &sink.messages()[0].data;
+		assert!(data.iter().any(|&b| b > 127), "8-bit bytes preserved");
 	}
 
 	#[tokio::test]
