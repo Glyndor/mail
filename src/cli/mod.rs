@@ -281,29 +281,21 @@ mod tests {
 	#[test]
 	fn token_hash_output_matches_sha256() {
 		// sha256("my-secret-token") as lowercase hex.
-		let digest =
-			ring::digest::digest(&ring::digest::SHA256, b"my-secret-token");
-		let expected_hex = digest
-			.as_ref()
-			.iter()
-			.fold(String::new(), |mut s, b| {
-				use std::fmt::Write;
-				write!(s, "{b:02x}").ok();
-				s
-			});
+		let digest = ring::digest::digest(&ring::digest::SHA256, b"my-secret-token");
+		let expected_hex = digest.as_ref().iter().fold(String::new(), |mut s, b| {
+			use std::fmt::Write;
+			write!(s, "{b:02x}").ok();
+			s
+		});
 		let expected = format!("sha256:{expected_hex}");
 		// Re-derive via the function under test through a second digest call
 		// (no stdout capture needed — the format is deterministic).
-		let digest2 =
-			ring::digest::digest(&ring::digest::SHA256, b"my-secret-token");
-		let hex2 = digest2
-			.as_ref()
-			.iter()
-			.fold(String::new(), |mut s, b| {
-				use std::fmt::Write;
-				write!(s, "{b:02x}").ok();
-				s
-			});
+		let digest2 = ring::digest::digest(&ring::digest::SHA256, b"my-secret-token");
+		let hex2 = digest2.as_ref().iter().fold(String::new(), |mut s, b| {
+			use std::fmt::Write;
+			write!(s, "{b:02x}").ok();
+			s
+		});
 		assert_eq!(expected, format!("sha256:{hex2}"));
 		assert!(expected.starts_with("sha256:"));
 		assert_eq!(expected.len(), 7 + 64);
