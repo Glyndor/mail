@@ -2,9 +2,11 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
 use super::directory::Directory;
@@ -16,6 +18,14 @@ use crate::directory_store::DirectoryHandle;
 
 /// Read buffer size per connection.
 const READ_BUFFER: usize = 4096;
+
+/// Maximum concurrent connections per listener. Excess connections are dropped
+/// immediately (TCP RST) to prevent file-descriptor exhaustion.
+const MAX_CONNECTIONS: usize = 1000;
+
+/// Per-read idle timeout. RFC 5321 §4.5.3.2 mandates at least 5 minutes between
+/// command-phase reads; we match that minimum to kill Slowloris connections.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Anything the connection loop can read from and write to.
 trait Connection: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -88,10 +98,16 @@ impl Server {
 
 	/// Accept connections forever. Each connection runs in its own task.
 	pub async fn serve(self: Arc<Self>, listener: TcpListener) -> std::io::Result<()> {
+		let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 		loop {
 			let (stream, peer) = listener.accept().await?;
+			let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
+				tracing::warn!(%peer, "SMTP connection limit reached, dropping");
+				continue;
+			};
 			let server = Arc::clone(&self);
 			tokio::spawn(async move {
+				let _permit = permit;
 				tracing::debug!(%peer, "connection accepted");
 				if let Err(error) = server.handle(stream, Some(peer.ip())).await {
 					tracing::debug!(%peer, %error, "connection ended with error");
@@ -142,7 +158,19 @@ impl Server {
 			let line = match decoder.next_line() {
 				Ok(Some(line)) => line,
 				Ok(None) => {
-					let read = stream.read(&mut buffer).await?;
+					let read = match tokio::time::timeout(
+						COMMAND_TIMEOUT,
+						stream.read(&mut buffer),
+					)
+					.await
+					{
+						Ok(Ok(n)) => n,
+						Ok(Err(e)) => return Err(e),
+						Err(_) => {
+							tracing::debug!("SMTP command timeout, closing connection");
+							return Ok(());
+						}
+					};
 					if read == 0 {
 						return Ok(());
 					}

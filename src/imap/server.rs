@@ -2,9 +2,11 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
 use crate::directory_store::DirectoryHandle;
@@ -20,6 +22,13 @@ pub enum TlsMode {
 	/// Plaintext greeting; STARTTLS upgrade required before LOGIN (`imap`, 143).
 	StartTls,
 }
+
+/// Maximum concurrent IMAP connections per listener.
+const MAX_CONNECTIONS: usize = 500;
+
+/// Idle read timeout. RFC 9051 §5.4 recommends the server close the connection
+/// after 30 minutes of inactivity; we enforce it to kill Slowloris sessions.
+const READ_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Anything the connection loop can read from and write to.
 trait Connection: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -55,10 +64,16 @@ impl Server {
 
 	/// Accept connections forever.
 	pub async fn serve(self: Arc<Self>, listener: TcpListener) -> std::io::Result<()> {
+		let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 		loop {
 			let (stream, peer) = listener.accept().await?;
+			let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
+				tracing::warn!(%peer, "IMAP connection limit reached, dropping");
+				continue;
+			};
 			let server = Arc::clone(&self);
 			tokio::spawn(async move {
+				let _permit = permit;
 				tracing::debug!(%peer, "imap connection accepted");
 				if let Err(error) = server.handle(stream).await {
 					tracing::debug!(%peer, %error, "imap connection ended with error");
@@ -106,7 +121,20 @@ impl Server {
 			let line = match decoder.next_line() {
 				Ok(Some(line)) => line,
 				Ok(None) => {
-					let read = stream.read(&mut buffer).await?;
+					let read = match tokio::time::timeout(
+						READ_TIMEOUT,
+						stream.read(&mut buffer),
+					)
+					.await
+					{
+						Ok(Ok(n)) => n,
+						Ok(Err(e)) => return Err(e),
+						Err(_) => {
+							tracing::debug!("IMAP idle timeout, closing connection");
+							let _ = stream.write_all(b"* BYE idle timeout\r\n").await;
+							return Ok(());
+						}
+					};
 					if read == 0 {
 						return Ok(());
 					}
@@ -180,7 +208,20 @@ impl Server {
 								// Anything else during IDLE is ignored.
 							}
 							Ok(None) => {
-								let read = stream.read(&mut buffer).await?;
+								let read = match tokio::time::timeout(
+									READ_TIMEOUT,
+									stream.read(&mut buffer),
+								)
+								.await
+								{
+									Ok(Ok(n)) => n,
+									Ok(Err(e)) => return Err(e),
+									Err(_) => {
+										tracing::debug!("IMAP idle timeout during IDLE, closing");
+										let _ = stream.write_all(b"* BYE idle timeout\r\n").await;
+										return Ok(());
+									}
+								};
 								if read == 0 {
 									return Ok(());
 								}
