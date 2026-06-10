@@ -1,5 +1,6 @@
 //! Shared API state and bearer-token authentication.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
@@ -20,6 +21,7 @@ pub struct ApiState {
 struct Inner {
 	/// Token hash: either `sha256:<lowercase-hex>` or a legacy argon2id PHC string.
 	token_hash: String,
+	data_dir: PathBuf,
 	domains: Vec<String>,
 	store: Arc<AccountStore>,
 	spool: FsSpool,
@@ -78,6 +80,7 @@ impl ApiState {
 	/// Build the state from configuration data.
 	pub fn new(
 		token_hash: &str,
+		data_dir: PathBuf,
 		domains: Vec<String>,
 		store: Arc<AccountStore>,
 		spool: FsSpool,
@@ -85,6 +88,7 @@ impl ApiState {
 		ApiState {
 			inner: Arc::new(Inner {
 				token_hash: token_hash.to_string(),
+				data_dir,
 				domains,
 				store,
 				spool,
@@ -116,6 +120,10 @@ impl ApiState {
 
 	pub fn spool(&self) -> &FsSpool {
 		&self.inner.spool
+	}
+
+	pub fn data_dir(&self) -> &std::path::Path {
+		&self.inner.data_dir
 	}
 
 	fn token_matches(&self, token: &str) -> bool {

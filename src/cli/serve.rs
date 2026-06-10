@@ -101,6 +101,7 @@ async fn serve(config: Config) -> std::io::Result<()> {
 					.ok_or_else(|| std::io::Error::other("api listener without [api] section"))?;
 				let state = crate::api::ApiState::new(
 					&api.token_hash,
+					config.data_dir.clone(),
 					config.domains.clone(),
 					Arc::clone(&account_store),
 					crate::storage::FsSpool::open(&config.data_dir)?,

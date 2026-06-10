@@ -2,6 +2,7 @@
 
 mod accounts;
 mod domains;
+mod mailboxes;
 mod queue;
 mod status;
 
@@ -21,6 +22,7 @@ pub fn router() -> Router<ApiState> {
 			"/accounts/{name}/password",
 			axum::routing::put(accounts::set_password),
 		)
+		.route("/accounts/{name}/mailboxes", get(mailboxes::list))
 		.route("/queue", get(queue::list))
 		.route("/queue/{id}", axum::routing::delete(queue::remove))
 }

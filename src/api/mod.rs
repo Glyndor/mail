@@ -78,6 +78,7 @@ mod tests {
 		);
 		ApiState::new(
 			&crate::smtp::auth::tests::hash(TOKEN),
+			dir.to_path_buf(),
 			vec!["example.org".to_string()],
 			store,
 			spool,
@@ -342,12 +343,44 @@ mod tests {
 			)
 			.expect("store"),
 		);
-		let state = ApiState::new(&sha256_hash(TOKEN), vec![], store, spool);
+		let state = ApiState::new(
+			&sha256_hash(TOKEN),
+			dir.path().to_path_buf(),
+			vec![],
+			store,
+			spool,
+		);
 		let app = router(state);
 		let (status, _) = request(&app, "GET", "/api/v1/status", Some(TOKEN)).await;
 		assert_eq!(status, StatusCode::OK);
 		let (status, _) = request(&app, "GET", "/api/v1/status", Some("wrong")).await;
 		assert_eq!(status, StatusCode::UNAUTHORIZED);
+	}
+
+	#[tokio::test]
+	async fn mailboxes_lists_inbox_for_known_account() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let app = router(test_state(dir.path(), 0));
+		let (status, body) =
+			request(&app, "GET", "/api/v1/accounts/alice/mailboxes", Some(TOKEN)).await;
+		assert_eq!(status, StatusCode::OK);
+		let mailboxes = body["mailboxes"].as_array().expect("mailboxes");
+		assert!(mailboxes.iter().any(|m| m == "INBOX"), "{body}");
+	}
+
+	#[tokio::test]
+	async fn mailboxes_returns_404_for_unknown_account() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let app = router(test_state(dir.path(), 0));
+		let (status, body) = request(
+			&app,
+			"GET",
+			"/api/v1/accounts/nobody/mailboxes",
+			Some(TOKEN),
+		)
+		.await;
+		assert_eq!(status, StatusCode::NOT_FOUND);
+		assert_eq!(body["error"]["code"], "not_found");
 	}
 
 	#[tokio::test]
