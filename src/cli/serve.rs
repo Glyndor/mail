@@ -12,6 +12,13 @@ use crate::storage::SplitDelivery;
 
 /// Run the server with a validated configuration.
 pub fn run(config: Config) -> ExitCode {
+	tracing_subscriber::fmt()
+		.with_env_filter(
+			tracing_subscriber::EnvFilter::try_from_default_env()
+				.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+		)
+		.init();
+
 	let runtime = match tokio::runtime::Runtime::new() {
 		Ok(runtime) => runtime,
 		Err(error) => {
