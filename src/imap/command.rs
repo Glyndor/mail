@@ -237,10 +237,10 @@ pub fn parse(line: &str) -> Result<Tagged, ParseError> {
 			mailbox: parse_mailbox(&tag, args)?,
 		},
 		"LSUB" => {
-			let (reference, rest) = parse_astring(args)
-				.ok_or_else(|| ParseError::BadArguments(tag.clone()))?;
-			let (pattern, rest) = parse_astring(rest)
-				.ok_or_else(|| ParseError::BadArguments(tag.clone()))?;
+			let (reference, rest) =
+				parse_astring(args).ok_or_else(|| ParseError::BadArguments(tag.clone()))?;
+			let (pattern, rest) =
+				parse_astring(rest).ok_or_else(|| ParseError::BadArguments(tag.clone()))?;
 			if !rest.trim().is_empty() {
 				return Err(ParseError::BadArguments(tag));
 			}

@@ -380,7 +380,14 @@ fn write_subscriptions(data_dir: &Path, account: &str, names: &[String]) -> std:
 	if let Some(parent) = path.parent() {
 		std::fs::create_dir_all(parent)?;
 	}
-	std::fs::write(&path, names.iter().fold(String::new(), |mut s, n| { s.push_str(n); s.push('\n'); s }))
+	std::fs::write(
+		&path,
+		names.iter().fold(String::new(), |mut s, n| {
+			s.push_str(n);
+			s.push('\n');
+			s
+		}),
+	)
 }
 
 fn read_flags(account_dir: &Path, id: Uuid) -> Vec<Flag> {

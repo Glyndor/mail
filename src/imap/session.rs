@@ -212,14 +212,12 @@ impl Session {
 			} => self.copy(&tag, &sequence, &mailbox, uid, remove_source),
 			Command::Search { criteria, uid } => self.search(&tag, &criteria, uid),
 			Command::Status { mailbox, items } => self.status(&tag, &mailbox, &items),
-			Command::Subscribe { mailbox } => self.subscription_op(
-				&tag,
-				|data_dir, account| mailbox::subscribe(data_dir, account, &mailbox),
-			),
-			Command::Unsubscribe { mailbox } => self.subscription_op(
-				&tag,
-				|data_dir, account| mailbox::unsubscribe(data_dir, account, &mailbox),
-			),
+			Command::Subscribe { mailbox } => self.subscription_op(&tag, |data_dir, account| {
+				mailbox::subscribe(data_dir, account, &mailbox)
+			}),
+			Command::Unsubscribe { mailbox } => self.subscription_op(&tag, |data_dir, account| {
+				mailbox::unsubscribe(data_dir, account, &mailbox)
+			}),
 			Command::Lsub { pattern, .. } => self.lsub(&tag, &pattern),
 		}
 	}
@@ -1441,6 +1439,9 @@ mod tests {
 		let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_718_000_000);
 		let s = format_internaldate(t);
 		// 2024-06-10 in UTC; day >= 10 so no leading space.
-		assert!(!s.starts_with(' '), "expected no leading space for day >= 10: {s}");
+		assert!(
+			!s.starts_with(' '),
+			"expected no leading space for day >= 10: {s}"
+		);
 	}
 }
