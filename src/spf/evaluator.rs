@@ -36,9 +36,17 @@ impl SpfOutcome {
 }
 
 /// Evaluate SPF for `ip` sending mail from `domain`.
-pub async fn check_host(dns: &dyn DnsLookup, ip: IpAddr, domain: &str) -> SpfOutcome {
+/// `sender` is the RFC 5321 MAIL FROM address (empty for null reverse-path).
+/// `helo` is the EHLO/HELO domain announced by the client.
+pub async fn check_host(
+	dns: &dyn DnsLookup,
+	ip: IpAddr,
+	domain: &str,
+	sender: &str,
+	helo: &str,
+) -> SpfOutcome {
 	let mut budget = MAX_DNS_MECHANISMS;
-	check_host_inner(dns, ip, domain, &mut budget, 0).await
+	check_host_inner(dns, ip, domain, sender, helo, &mut budget, 0).await
 }
 
 /// Recursion depth guard: includes/redirects each consume DNS budget, but a
@@ -49,6 +57,8 @@ async fn check_host_inner(
 	dns: &dyn DnsLookup,
 	ip: IpAddr,
 	domain: &str,
+	sender: &str,
+	helo: &str,
 	budget: &mut u32,
 	depth: u32,
 ) -> SpfOutcome {
@@ -81,8 +91,12 @@ async fn check_host_inner(
 				if !consume(budget) {
 					return SpfOutcome::PermError;
 				}
-				let name = target.as_deref().unwrap_or(domain);
-				match dns.addresses(name).await {
+				let spec = target.as_deref().unwrap_or(domain);
+				let name = match expand_macro(spec, ip, domain, sender, helo) {
+					Ok(n) => n,
+					Err(e) => return e,
+				};
+				match dns.addresses(&name).await {
 					Ok(addresses) => addresses
 						.iter()
 						.any(|address| address_matches(ip, *address, *prefix4, *prefix6)),
@@ -97,8 +111,12 @@ async fn check_host_inner(
 				if !consume(budget) {
 					return SpfOutcome::PermError;
 				}
-				let name = target.as_deref().unwrap_or(domain);
-				let exchangers = match dns.mx(name).await {
+				let spec = target.as_deref().unwrap_or(domain);
+				let name = match expand_macro(spec, ip, domain, sender, helo) {
+					Ok(n) => n,
+					Err(e) => return e,
+				};
+				let exchangers = match dns.mx(&name).await {
 					Ok(exchangers) => exchangers,
 					Err(DnsFailure::Temporary) => return SpfOutcome::TempError,
 				};
@@ -119,11 +137,25 @@ async fn check_host_inner(
 				}
 				matched
 			}
-			Mechanism::Include { domain: included } => {
+			Mechanism::Include { domain: spec } => {
 				if !consume(budget) {
 					return SpfOutcome::PermError;
 				}
-				match Box::pin(check_host_inner(dns, ip, included, budget, depth + 1)).await {
+				let included = match expand_macro(spec, ip, domain, sender, helo) {
+					Ok(d) => d,
+					Err(e) => return e,
+				};
+				match Box::pin(check_host_inner(
+					dns,
+					ip,
+					&included,
+					sender,
+					helo,
+					budget,
+					depth + 1,
+				))
+				.await
+				{
 					SpfOutcome::Pass => true,
 					SpfOutcome::Fail | SpfOutcome::SoftFail | SpfOutcome::Neutral => false,
 					// include of a domain without a record is a permerror
@@ -167,11 +199,24 @@ async fn check_host_inner(
 		}
 	}
 
-	if let Some(redirect) = &record.redirect {
+	if let Some(spec) = &record.redirect {
 		if !consume(budget) {
 			return SpfOutcome::PermError;
 		}
-		let outcome = Box::pin(check_host_inner(dns, ip, redirect, budget, depth + 1)).await;
+		let target = match expand_macro(spec, ip, domain, sender, helo) {
+			Ok(d) => d,
+			Err(e) => return e,
+		};
+		let outcome = Box::pin(check_host_inner(
+			dns,
+			ip,
+			&target,
+			sender,
+			helo,
+			budget,
+			depth + 1,
+		))
+		.await;
 		// A redirect target without a record is a permerror (section 6.1).
 		return if outcome == SpfOutcome::None {
 			SpfOutcome::PermError
@@ -238,234 +283,148 @@ fn v6_in_network(ip: std::net::Ipv6Addr, network: std::net::Ipv6Addr, prefix: u8
 	(u128::from(ip) & mask) == (u128::from(network) & mask)
 }
 
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use std::collections::HashMap;
-	use std::pin::Pin;
-
-	/// Scripted resolver: maps of name → records.
-	#[derive(Default)]
-	struct FakeDns {
-		txt: HashMap<String, Vec<String>>,
-		addresses: HashMap<String, Vec<IpAddr>>,
-		mx: HashMap<String, Vec<String>>,
-		fail_txt: bool,
+/// Expand macro-strings in a domain-spec (RFC 7208 §7).
+/// Returns `PermError` on malformed macro syntax or unknown macro letter.
+/// Fast-paths if `spec` contains no `%`.
+pub(crate) fn expand_macro(
+	spec: &str,
+	ip: IpAddr,
+	current_domain: &str,
+	sender: &str,
+	helo: &str,
+) -> Result<String, SpfOutcome> {
+	if !spec.contains('%') {
+		return Ok(spec.to_string());
 	}
-
-	impl DnsLookup for FakeDns {
-		fn txt(
-			&self,
-			name: &str,
-		) -> Pin<Box<dyn Future<Output = Result<Vec<String>, DnsFailure>> + Send + '_>> {
-			let result = if self.fail_txt {
-				Err(DnsFailure::Temporary)
-			} else {
-				Ok(self.txt.get(name).cloned().unwrap_or_default())
-			};
-			Box::pin(async move { result })
+	let mut result = String::with_capacity(spec.len() * 2);
+	let mut rest = spec;
+	while let Some(offset) = rest.find('%') {
+		result.push_str(&rest[..offset]);
+		rest = &rest[offset + 1..];
+		let ch = rest.chars().next().ok_or(SpfOutcome::PermError)?;
+		match ch {
+			'%' => {
+				result.push('%');
+				rest = &rest[1..];
+			}
+			'_' => {
+				result.push(' ');
+				rest = &rest[1..];
+			}
+			'-' => {
+				result.push_str("%20");
+				rest = &rest[1..];
+			}
+			'{' => {
+				let close = rest.find('}').ok_or(SpfOutcome::PermError)?;
+				let inner = &rest[1..close];
+				rest = &rest[close + 1..];
+				result.push_str(&expand_macro_inner(
+					inner,
+					ip,
+					current_domain,
+					sender,
+					helo,
+				)?);
+			}
+			_ => return Err(SpfOutcome::PermError),
 		}
+	}
+	result.push_str(rest);
+	Ok(result)
+}
 
-		fn addresses(
-			&self,
-			name: &str,
-		) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, DnsFailure>> + Send + '_>> {
-			let result = Ok(self.addresses.get(name).cloned().unwrap_or_default());
-			Box::pin(async move { result })
+/// Expand the content of `%{...}` (letter + optional transformers).
+fn expand_macro_inner(
+	inner: &str,
+	ip: IpAddr,
+	current_domain: &str,
+	sender: &str,
+	helo: &str,
+) -> Result<String, SpfOutcome> {
+	let mut chars = inner.chars();
+	let letter = chars
+		.next()
+		.ok_or(SpfOutcome::PermError)?
+		.to_ascii_lowercase();
+	let (count, reverse, delimiters) = parse_macro_transformers(chars.as_str())?;
+
+	let raw = match letter {
+		's' => sender.to_string(),
+		'l' => sender
+			.split_once('@')
+			.map_or(sender, |(local, _)| local)
+			.to_string(),
+		'o' => sender
+			.rsplit_once('@')
+			.map_or(sender, |(_, domain)| domain)
+			.to_string(),
+		'd' => current_domain.to_string(),
+		'i' => ip_to_macro_str(ip),
+		'v' => match ip {
+			IpAddr::V4(_) => "in-addr".to_string(),
+			IpAddr::V6(_) => "ip6".to_string(),
+		},
+		'h' => helo.to_string(),
+		_ => return Err(SpfOutcome::PermError),
+	};
+
+	let mut parts: Vec<&str> = raw.split(|c: char| delimiters.contains(&c)).collect();
+	if reverse {
+		parts.reverse();
+	}
+	if let Some(n) = count {
+		let skip = parts.len().saturating_sub(n);
+		parts.drain(..skip);
+	}
+	Ok(parts.join("."))
+}
+
+/// Parse `[digit][r][delimiter...]` macro transformers (RFC 7208 §7.1).
+fn parse_macro_transformers(s: &str) -> Result<(Option<usize>, bool, Vec<char>), SpfOutcome> {
+	let count_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+	let count = if count_end == 0 {
+		None
+	} else {
+		Some(
+			s[..count_end]
+				.parse::<usize>()
+				.map_err(|_| SpfOutcome::PermError)?,
+		)
+	};
+	let rest = &s[count_end..];
+
+	let reverse = matches!(rest.chars().next(), Some('r') | Some('R'));
+	let delimiters_str = if reverse { &rest[1..] } else { rest };
+
+	let delimiters = if delimiters_str.is_empty() {
+		vec!['.']
+	} else {
+		let chars: Vec<char> = delimiters_str.chars().collect();
+		for &d in &chars {
+			if !".+-,/_=".contains(d) {
+				return Err(SpfOutcome::PermError);
+			}
 		}
+		chars
+	};
 
-		fn mx(
-			&self,
-			name: &str,
-		) -> Pin<Box<dyn Future<Output = Result<Vec<String>, DnsFailure>> + Send + '_>> {
-			let result = Ok(self.mx.get(name).cloned().unwrap_or_default());
-			Box::pin(async move { result })
+	Ok((count, reverse, delimiters))
+}
+
+/// Format `ip` for use in macro expansion (RFC 7208 §7.3).
+/// IPv4: dotted-decimal. IPv6: 32 lowercase hex nibbles separated by `.`.
+fn ip_to_macro_str(ip: IpAddr) -> String {
+	match ip {
+		IpAddr::V4(v4) => v4.to_string(),
+		IpAddr::V6(v6) => {
+			let nibbles: Vec<String> = v6
+				.octets()
+				.iter()
+				.flat_map(|&b| [format!("{:x}", (b >> 4) & 0xf), format!("{:x}", b & 0xf)])
+				.collect();
+			nibbles.join(".")
 		}
-	}
-
-	fn dns_with(records: &[(&str, &str)]) -> FakeDns {
-		let mut dns = FakeDns::default();
-		for (name, record) in records {
-			dns.txt
-				.entry(name.to_string())
-				.or_default()
-				.push(record.to_string());
-		}
-		dns
-	}
-
-	fn ip(text: &str) -> IpAddr {
-		text.parse().expect("ip")
-	}
-
-	async fn outcome(dns: &FakeDns, from_ip: &str, domain: &str) -> SpfOutcome {
-		check_host(dns, ip(from_ip), domain).await
-	}
-
-	#[tokio::test]
-	async fn no_record_is_none() {
-		let dns = FakeDns::default();
-		assert_eq!(
-			outcome(&dns, "192.0.2.1", "example.org").await,
-			SpfOutcome::None
-		);
-	}
-
-	#[tokio::test]
-	async fn ip4_match_passes_and_all_fails() {
-		let dns = dns_with(&[("example.org", "v=spf1 ip4:192.0.2.0/24 -all")]);
-		assert_eq!(
-			outcome(&dns, "192.0.2.99", "example.org").await,
-			SpfOutcome::Pass
-		);
-		assert_eq!(
-			outcome(&dns, "198.51.100.1", "example.org").await,
-			SpfOutcome::Fail
-		);
-	}
-
-	#[tokio::test]
-	async fn ip6_match() {
-		let dns = dns_with(&[("example.org", "v=spf1 ip6:2001:db8::/32 ~all")]);
-		assert_eq!(
-			outcome(&dns, "2001:db8::1", "example.org").await,
-			SpfOutcome::Pass
-		);
-		assert_eq!(
-			outcome(&dns, "2001:db9::1", "example.org").await,
-			SpfOutcome::SoftFail
-		);
-	}
-
-	#[tokio::test]
-	async fn a_mechanism_resolves_the_domain() {
-		let mut dns = dns_with(&[("example.org", "v=spf1 a -all")]);
-		dns.addresses
-			.insert("example.org".into(), vec![ip("192.0.2.10")]);
-		assert_eq!(
-			outcome(&dns, "192.0.2.10", "example.org").await,
-			SpfOutcome::Pass
-		);
-		assert_eq!(
-			outcome(&dns, "192.0.2.11", "example.org").await,
-			SpfOutcome::Fail
-		);
-	}
-
-	#[tokio::test]
-	async fn mx_mechanism_resolves_exchangers() {
-		let mut dns = dns_with(&[("example.org", "v=spf1 mx -all")]);
-		dns.mx
-			.insert("example.org".into(), vec!["mx.example.org".into()]);
-		dns.addresses
-			.insert("mx.example.org".into(), vec![ip("192.0.2.20")]);
-		assert_eq!(
-			outcome(&dns, "192.0.2.20", "example.org").await,
-			SpfOutcome::Pass
-		);
-	}
-
-	#[tokio::test]
-	async fn include_passes_through() {
-		let dns = dns_with(&[
-			("example.org", "v=spf1 include:_spf.example.org -all"),
-			("_spf.example.org", "v=spf1 ip4:192.0.2.0/24 -all"),
-		]);
-		assert_eq!(
-			outcome(&dns, "192.0.2.5", "example.org").await,
-			SpfOutcome::Pass
-		);
-		// A fail inside the include does not match; outer -all decides.
-		assert_eq!(
-			outcome(&dns, "198.51.100.1", "example.org").await,
-			SpfOutcome::Fail
-		);
-	}
-
-	#[tokio::test]
-	async fn include_of_missing_record_is_permerror() {
-		let dns = dns_with(&[("example.org", "v=spf1 include:missing.example -all")]);
-		assert_eq!(
-			outcome(&dns, "192.0.2.1", "example.org").await,
-			SpfOutcome::PermError
-		);
-	}
-
-	#[tokio::test]
-	async fn redirect_is_followed() {
-		let dns = dns_with(&[
-			("example.org", "v=spf1 redirect=_spf.example.org"),
-			("_spf.example.org", "v=spf1 ip4:192.0.2.0/24 -all"),
-		]);
-		assert_eq!(
-			outcome(&dns, "192.0.2.5", "example.org").await,
-			SpfOutcome::Pass
-		);
-		assert_eq!(
-			outcome(&dns, "198.51.100.1", "example.org").await,
-			SpfOutcome::Fail
-		);
-	}
-
-	#[tokio::test]
-	async fn lookup_loop_hits_the_budget() {
-		let dns = dns_with(&[
-			("a.example", "v=spf1 include:b.example -all"),
-			("b.example", "v=spf1 include:a.example -all"),
-		]);
-		assert_eq!(
-			outcome(&dns, "192.0.2.1", "a.example").await,
-			SpfOutcome::PermError
-		);
-	}
-
-	#[tokio::test]
-	async fn malformed_record_is_permerror() {
-		let dns = dns_with(&[("example.org", "v=spf1 ip4:notanip -all")]);
-		assert_eq!(
-			outcome(&dns, "192.0.2.1", "example.org").await,
-			SpfOutcome::PermError
-		);
-	}
-
-	#[tokio::test]
-	async fn multiple_records_are_permerror() {
-		let dns = dns_with(&[
-			("example.org", "v=spf1 -all"),
-			("example.org", "v=spf1 +all"),
-		]);
-		assert_eq!(
-			outcome(&dns, "192.0.2.1", "example.org").await,
-			SpfOutcome::PermError
-		);
-	}
-
-	#[tokio::test]
-	async fn dns_failure_is_temperror() {
-		let mut dns = dns_with(&[("example.org", "v=spf1 -all")]);
-		dns.fail_txt = true;
-		assert_eq!(
-			outcome(&dns, "192.0.2.1", "example.org").await,
-			SpfOutcome::TempError
-		);
-	}
-
-	#[tokio::test]
-	async fn no_match_without_all_is_neutral() {
-		let dns = dns_with(&[("example.org", "v=spf1 ip4:192.0.2.0/24")]);
-		assert_eq!(
-			outcome(&dns, "198.51.100.1", "example.org").await,
-			SpfOutcome::Neutral
-		);
-	}
-
-	#[tokio::test]
-	async fn zero_prefix_matches_everything() {
-		let dns = dns_with(&[("example.org", "v=spf1 ip4:0.0.0.0/0 -all")]);
-		assert_eq!(
-			outcome(&dns, "203.0.113.7", "example.org").await,
-			SpfOutcome::Pass
-		);
 	}
 
 	#[tokio::test]
@@ -517,3 +476,7 @@ mod tests {
 		);
 	}
 }
+
+#[cfg(test)]
+#[path = "evaluator_tests.rs"]
+mod tests;

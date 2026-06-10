@@ -199,7 +199,17 @@ impl Server {
 					{
 						let domain = spf_domain(&message.reverse_path, session.helo_domain());
 						let outcome = match &domain {
-							Some(domain) => crate::spf::check_host(dns.as_ref(), ip, domain).await,
+							Some(domain) => {
+								let helo = session.helo_domain().unwrap_or("");
+								crate::spf::check_host(
+									dns.as_ref(),
+									ip,
+									domain,
+									&message.reverse_path,
+									helo,
+								)
+								.await
+							}
 							None => crate::spf::SpfOutcome::None,
 						};
 						match outcome {
