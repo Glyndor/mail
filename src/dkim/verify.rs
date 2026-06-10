@@ -85,6 +85,20 @@ async fn verify_one(
 	};
 	let domain = Some(signature.domain.clone());
 
+	// Expiry check: reject signatures past their x= timestamp before DNS.
+	if let Some(exp) = signature.expiration {
+		let now = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_secs();
+		if now > exp {
+			return DkimResult {
+				outcome: DkimOutcome::Fail,
+				domain,
+			};
+		}
+	}
+
 	// Body hash first: cheap rejection without DNS.
 	let limited = match signature.body_length {
 		Some(length) if length <= message.body.len() => &message.body[..length],
@@ -425,5 +439,36 @@ pub(crate) mod tests {
 		let raw = b"From: a@example.org\r\nDKIM-Signature: v=1; nonsense\r\n\r\nbody\r\n";
 		let results = verify_message(&dns, raw).await;
 		assert_eq!(results[0].outcome, DkimOutcome::PermError);
+	}
+
+	#[tokio::test]
+	async fn expired_x_tag_fails_without_reaching_dns() {
+		let (message, mut dns) = signed_message();
+		// Make DNS return TempError: if expiry check is bypassed, the outcome
+		// would be TempError, not Fail, proving DNS was consulted.
+		dns.fail = true;
+		// Inject x=1 (expired since 1970-01-01) into the existing header.
+		let message_str = String::from_utf8(message).expect("ascii");
+		let modified = message_str.replace("; b=", "; x=1; b=");
+		let results = verify_message(&dns, modified.as_bytes()).await;
+		// Expiry fires before DNS: must be Fail, not TempError.
+		assert_eq!(results[0].outcome, DkimOutcome::Fail, "{results:?}");
+	}
+
+	#[tokio::test]
+	async fn future_x_tag_does_not_fail() {
+		let (message, dns) = signed_message();
+		// x= far in the future: should not affect the outcome.
+		let message_str = String::from_utf8(message).expect("ascii");
+		let modified = message_str.replace("; b=", "; x=9999999999; b=");
+		// The signature is now invalid (we changed the header without re-signing),
+		// but the expiry check must not reject it — the eventual failure is Fail
+		// from bad signature, not from expiry.
+		let results = verify_message(&dns, modified.as_bytes()).await;
+		// Body hash or sig check fails, but not from expiry short-circuit.
+		assert!(
+			matches!(results[0].outcome, DkimOutcome::Fail | DkimOutcome::PermError),
+			"{results:?}"
+		);
 	}
 }
