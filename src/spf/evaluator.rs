@@ -426,57 +426,12 @@ fn ip_to_macro_str(ip: IpAddr) -> String {
 			nibbles.join(".")
 		}
 	}
-
-	#[tokio::test]
-	async fn exists_matches_when_domain_has_an_a_record() {
-		let mut dns = dns_with(&[("example.org", "v=spf1 exists:_spf.example.org -all")]);
-		dns.addresses
-			.insert("_spf.example.org".into(), vec![ip("192.0.2.1")]);
-		assert_eq!(
-			outcome(&dns, "198.51.100.7", "example.org").await,
-			SpfOutcome::Pass
-		);
-	}
-
-	#[tokio::test]
-	async fn exists_does_not_match_when_domain_is_empty() {
-		let dns = dns_with(&[("example.org", "v=spf1 exists:_absent.example.org -all")]);
-		// No address record for _absent.example.org → mechanism does not match.
-		assert_eq!(
-			outcome(&dns, "198.51.100.7", "example.org").await,
-			SpfOutcome::Fail
-		);
-	}
-
-	#[tokio::test]
-	async fn ptr_does_not_match_and_falls_through() {
-		// ptr: is deprecated; treated as non-matching so the next term decides.
-		let dns = dns_with(&[(
-			"example.org",
-			"v=spf1 ptr:example.org ip4:192.0.2.0/24 -all",
-		)]);
-		// ptr non-match → ip4 hit → Pass
-		assert_eq!(
-			outcome(&dns, "192.0.2.5", "example.org").await,
-			SpfOutcome::Pass
-		);
-		// ptr non-match → ip4 miss → -all → Fail
-		assert_eq!(
-			outcome(&dns, "198.51.100.5", "example.org").await,
-			SpfOutcome::Fail
-		);
-	}
-
-	#[tokio::test]
-	async fn bare_ptr_does_not_match_and_falls_through() {
-		let dns = dns_with(&[("example.org", "v=spf1 ptr ~all")]);
-		assert_eq!(
-			outcome(&dns, "192.0.2.5", "example.org").await,
-			SpfOutcome::SoftFail
-		);
-	}
 }
 
 #[cfg(test)]
 #[path = "evaluator_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "evaluator_macro_tests.rs"]
+mod macro_tests;
