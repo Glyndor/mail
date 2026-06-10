@@ -358,9 +358,15 @@ mod tests {
 		record_delivery(dir.path(), "20240101", &record);
 
 		let dns = dns_with_dmarc("example.org", "reject");
-		let messages =
-			flush_pending(dir.path(), "20240102", "Org", "admin@org.example", "org.example", &dns)
-				.await;
+		let messages = flush_pending(
+			dir.path(),
+			"20240102",
+			"Org",
+			"admin@org.example",
+			"org.example",
+			&dns,
+		)
+		.await;
 
 		assert_eq!(messages.len(), 1);
 		assert_eq!(messages[0].recipients, ["dmarc@example.org"]);
@@ -383,9 +389,15 @@ mod tests {
 
 		// Pass today = same day as the record directory.
 		let dns = dns_with_dmarc("example.org", "reject");
-		let messages =
-			flush_pending(dir.path(), "20240101", "Org", "admin@org.example", "org.example", &dns)
-				.await;
+		let messages = flush_pending(
+			dir.path(),
+			"20240101",
+			"Org",
+			"admin@org.example",
+			"org.example",
+			&dns,
+		)
+		.await;
 
 		assert!(messages.is_empty(), "today's directory must not be flushed");
 		let jsonl = dir
@@ -404,9 +416,15 @@ mod tests {
 
 		// DNS returns no DMARC record at all.
 		let dns = FakeDns::default();
-		let messages =
-			flush_pending(dir.path(), "20240102", "Org", "admin@org.example", "org.example", &dns)
-				.await;
+		let messages = flush_pending(
+			dir.path(),
+			"20240102",
+			"Org",
+			"admin@org.example",
+			"org.example",
+			&dns,
+		)
+		.await;
 
 		assert!(messages.is_empty(), "no rua= must produce no messages");
 		let jsonl = dir
@@ -414,7 +432,10 @@ mod tests {
 			.join("dmarc-reports")
 			.join("20240101")
 			.join("example.org.jsonl");
-		assert!(!jsonl.exists(), "file must still be removed when rua= absent");
+		assert!(
+			!jsonl.exists(),
+			"file must still be removed when rua= absent"
+		);
 	}
 
 	#[tokio::test]
@@ -425,9 +446,15 @@ mod tests {
 		std::fs::write(day_dir.join("example.org.jsonl"), b"").expect("write");
 
 		let dns = dns_with_dmarc("example.org", "reject");
-		let messages =
-			flush_pending(dir.path(), "20240102", "Org", "admin@org.example", "org.example", &dns)
-				.await;
+		let messages = flush_pending(
+			dir.path(),
+			"20240102",
+			"Org",
+			"admin@org.example",
+			"org.example",
+			&dns,
+		)
+		.await;
 
 		assert!(messages.is_empty());
 		assert!(!day_dir.join("example.org.jsonl").exists());
@@ -438,9 +465,15 @@ mod tests {
 		let dir = tempfile::tempdir().expect("tempdir");
 		// No dmarc-reports directory at all.
 		let dns = dns_with_dmarc("example.org", "reject");
-		let messages =
-			flush_pending(dir.path(), "20240102", "Org", "admin@org.example", "org.example", &dns)
-				.await;
+		let messages = flush_pending(
+			dir.path(),
+			"20240102",
+			"Org",
+			"admin@org.example",
+			"org.example",
+			&dns,
+		)
+		.await;
 		assert!(messages.is_empty());
 	}
 
@@ -450,10 +483,19 @@ mod tests {
 		let record = sample_record("example.org");
 		record_delivery(dir.path(), "20240101", &record);
 
-		let dns = FakeDns { fail: true, ..FakeDns::default() };
-		let messages =
-			flush_pending(dir.path(), "20240102", "Org", "admin@org.example", "org.example", &dns)
-				.await;
+		let dns = FakeDns {
+			fail: true,
+			..FakeDns::default()
+		};
+		let messages = flush_pending(
+			dir.path(),
+			"20240102",
+			"Org",
+			"admin@org.example",
+			"org.example",
+			&dns,
+		)
+		.await;
 
 		assert!(messages.is_empty(), "DNS failure must produce no messages");
 		let jsonl = dir

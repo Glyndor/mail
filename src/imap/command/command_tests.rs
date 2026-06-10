@@ -227,7 +227,10 @@ fn parses_imap_date() {
 
 #[test]
 fn search_with_no_criteria_is_bad_arguments() {
-	assert!(matches!(parse("t1 SEARCH"), Err(ParseError::BadArguments(_))));
+	assert!(matches!(
+		parse("t1 SEARCH"),
+		Err(ParseError::BadArguments(_))
+	));
 }
 
 #[test]
