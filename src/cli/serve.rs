@@ -156,12 +156,30 @@ async fn serve(config: Config) -> std::io::Result<()> {
 		}
 	}
 
-	// Run until the first listener fails or the process is interrupted.
-	for task in tasks {
-		task.await
-			.map_err(|error| std::io::Error::other(error.to_string()))??;
+	// Run until the first listener fails or a shutdown signal is received.
+	let shutdown = async {
+		tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+			.expect("register SIGTERM handler")
+			.recv()
+			.await;
+	};
+	tokio::select! {
+		result = async {
+			for task in tasks {
+				task.await
+					.map_err(|error| std::io::Error::other(error.to_string()))??;
+			}
+			Ok::<(), std::io::Error>(())
+		} => result,
+		_ = shutdown => {
+			tracing::info!("SIGTERM received, shutting down");
+			Ok(())
+		}
+		_ = tokio::signal::ctrl_c() => {
+			tracing::info!("SIGINT received, shutting down");
+			Ok(())
+		}
 	}
-	Ok(())
 }
 
 #[cfg(test)]
