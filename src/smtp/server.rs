@@ -56,6 +56,8 @@ pub struct Server {
 	tls_mode: TlsMode,
 	directory: DirectoryHandle,
 	spf: Option<Arc<dyn crate::spf::DnsLookup>>,
+	/// If set, DMARC delivery records are written here for aggregate reports.
+	report_dir: Option<std::path::PathBuf>,
 }
 
 impl Server {
@@ -69,6 +71,7 @@ impl Server {
 			tls_mode: TlsMode::Opportunistic,
 			directory: DirectoryHandle::new(Directory::default()),
 			spf: None,
+			report_dir: None,
 		}
 	}
 
@@ -89,6 +92,13 @@ impl Server {
 	/// snapshot it at connection start.
 	pub fn with_directory(mut self, directory: DirectoryHandle) -> Self {
 		self.directory = directory;
+		self
+	}
+
+	/// Enable DMARC aggregate report storage. Delivery records are written
+	/// under `data_dir/dmarc-reports/` for later flushing and sending.
+	pub fn with_report_dir(mut self, data_dir: std::path::PathBuf) -> Self {
+		self.report_dir = Some(data_dir);
 		self
 	}
 
@@ -279,6 +289,47 @@ impl Server {
 									// No usable From header: nothing to align.
 									None => crate::dmarc::DmarcOutcome::PermError,
 								};
+								// Record DMARC result for aggregate reporting.
+								if let (Some(report_data_dir), Some(from_domain)) =
+									(&self.report_dir, &from)
+								{
+									let disposition = match &dmarc {
+										crate::dmarc::DmarcOutcome::Reject => "reject",
+										_ => "none",
+									};
+									let ts = std::time::SystemTime::now()
+										.duration_since(std::time::UNIX_EPOCH)
+										.map(|d| d.as_secs())
+										.unwrap_or(0);
+									let best_dkim = dkim_results.first();
+									let record = crate::dmarc::report::DeliveryRecord {
+										timestamp: ts,
+										source_ip: peer.map(|p| p.to_string()).unwrap_or_default(),
+										envelope_from: domain.as_deref().unwrap_or("").to_owned(),
+										header_from: from_domain.clone(),
+										spf: outcome.as_str().to_owned(),
+										dkim: best_dkim
+											.map(|r| r.outcome.as_str())
+											.unwrap_or("none")
+											.to_owned(),
+										dkim_domain: best_dkim
+											.and_then(|r| r.domain.clone())
+											.unwrap_or_default(),
+										dmarc: dmarc.as_str().to_owned(),
+										disposition: disposition.to_owned(),
+										policy_domain: from_domain.clone(),
+										published_policy: String::new(),
+										pct: 100,
+									};
+									let today =
+										crate::dmarc::aggregate::unix_to_day(record.timestamp);
+									crate::dmarc::aggregate::record_delivery(
+										report_data_dir,
+										&today,
+										&record,
+									);
+								}
+
 								match dmarc {
 									crate::dmarc::DmarcOutcome::Reject => {
 										send(
@@ -794,6 +845,7 @@ QUIT\r\n";
 			tls_mode: TlsMode::Implicit,
 			directory: DirectoryHandle::new(Directory::default()),
 			spf: None,
+			report_dir: None,
 		};
 		let (_client, server_stream) = tokio::io::duplex(1024);
 		assert!(server.handle(server_stream, None).await.is_err());

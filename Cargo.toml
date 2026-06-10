@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 argon2 = "0.5.3"
 axum = "0.8.9"
+flate2 = "1.1.9"
 base64 = "0.22.1"
 clap = { version = "4.6.1", features = ["derive"] }
 hickory-resolver = "0.26.1"
