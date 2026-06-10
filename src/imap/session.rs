@@ -106,12 +106,12 @@ impl Session {
 	}
 
 	fn capabilities(&self) -> String {
-		let mut capabilities = String::from("IMAP4rev2 MOVE");
+		let mut capabilities = String::from("IMAP4rev2 MOVE IDLE LITERAL+");
 		if self.tls_available {
 			capabilities.push_str(" STARTTLS");
 		}
 		if self.tls_active {
-			capabilities.push_str(" AUTH=PLAIN");
+			capabilities.push_str(" AUTH=PLAIN SASL-IR");
 		} else {
 			capabilities.push_str(" LOGINDISABLED");
 		}
@@ -896,7 +896,10 @@ mod tests {
 	fn greeting_announces_capabilities() {
 		let dir = tempfile::tempdir().expect("tempdir");
 		let session = Session::new("mail.example.org", dir.path().to_path_buf(), directory());
-		assert!(text(&session.greeting()).contains("IMAP4rev2"));
+		let greeting = text(&session.greeting());
+		assert!(greeting.contains("IMAP4rev2"), "{greeting}");
+		assert!(greeting.contains("IDLE"), "{greeting}");
+		assert!(greeting.contains("LITERAL+"), "{greeting}");
 	}
 
 	#[test]
