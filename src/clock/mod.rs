@@ -50,6 +50,25 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 	(if month <= 2 { year + 1 } else { year }, month, day)
 }
 
+/// Format a Unix timestamp (seconds) as an RFC 3339 / ISO 8601 date-time in
+/// UTC: `YYYY-MM-DDTHH:MM:SSZ`. Used for TLS-RPT report `date-range` values
+/// (RFC 8460 §4.3), which require ISO 8601 rather than the RFC 5322 form.
+pub fn rfc3339(unix_secs: u64) -> String {
+	let secs = unix_secs as i64;
+	let days_since_epoch = secs.div_euclid(86_400);
+	let seconds_of_day = secs.rem_euclid(86_400);
+	let (year, month, day) = civil_from_days(days_since_epoch);
+	format!(
+		"{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+		year,
+		month,
+		day,
+		seconds_of_day / 3600,
+		(seconds_of_day % 3600) / 60,
+		seconds_of_day % 60,
+	)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -95,5 +114,28 @@ mod tests {
 	fn pre_epoch_clamps_to_epoch() {
 		let before = UNIX_EPOCH - Duration::from_secs(86_400);
 		assert_eq!(rfc5322(before), "Thu, 01 Jan 1970 00:00:00 +0000");
+	}
+
+	#[test]
+	fn rfc3339_formats_epoch() {
+		assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+	}
+
+	#[test]
+	fn rfc3339_formats_known_datetime() {
+		// 2026-06-05 12:34:56 UTC.
+		assert_eq!(rfc3339(1_780_662_896), "2026-06-05T12:34:56Z");
+	}
+
+	#[test]
+	fn rfc3339_formats_leap_day() {
+		// 2024-02-29 00:00:00 UTC.
+		assert_eq!(rfc3339(1_709_164_800), "2024-02-29T00:00:00Z");
+	}
+
+	#[test]
+	fn rfc3339_formats_year_boundary() {
+		// 2025-12-31 23:59:59 UTC.
+		assert_eq!(rfc3339(1_767_225_599), "2025-12-31T23:59:59Z");
 	}
 }
