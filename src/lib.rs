@@ -18,3 +18,4 @@ pub mod smtp;
 pub mod spf;
 pub mod storage;
 pub mod tls;
+pub mod tlsrpt;
